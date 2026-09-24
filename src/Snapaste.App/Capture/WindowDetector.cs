@@ -18,7 +18,9 @@ public sealed class WindowDetector
             Native.DwmGetWindowAttribute(h, 14, out int cloaked, 4);
             if (cloaked != 0) return true;
             var r = Native.Bounds(h);
-            if (r.Width < 2 || r.Height < 2 || !r.Contains(p) || r == Native.Desktop) return true;
+            if (r.Width < 2 || r.Height < 2 || !r.Contains(p)) return true;
+            var name = new System.Text.StringBuilder(128); Native.GetClassName(h, name, name.Capacity);
+            if (name.ToString() is "Progman" or "WorkerW") return true;
             target = h; found = r; return false;
         }, 0);
         if (elements && !querying && (p - lastPoint).Length > 4)

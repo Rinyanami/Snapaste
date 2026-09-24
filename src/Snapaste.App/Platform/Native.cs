@@ -17,6 +17,7 @@ public static class Native
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(nint h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(nint h, out RECT rect);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(nint h, out uint process);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(nint h, System.Text.StringBuilder name, int count);
     public delegate bool EnumProc(nint h, nint p);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc proc, nint p);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(nint h, int attribute, out RECT rect, int size);

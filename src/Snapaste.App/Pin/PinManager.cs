@@ -24,9 +24,11 @@ public sealed class PinManager
     private readonly List<PinWindow> pins = [];
     private readonly DispatcherTimer saveTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
     private bool exiting;
+    private bool hasSessionState;
     public PinManager() { saveTimer.Tick += (_, _) => { saveTimer.Stop(); Save(); }; }
     public void Add(BitmapSource bitmap)
     {
+        hasSessionState = true;
         var settings = App.Current.Settings;
         var state = new PinState { X = Native.Cursor.X, Y = Native.Cursor.Y, Opacity = settings.PinOpacity, Scale = settings.PinScale, Topmost = settings.PinTopmost };
         state.ImagePath = Path.Combine(Paths.Pins, state.Id + ".png"); ImageDocument.SaveBitmap(bitmap, state.ImagePath); Open(state, bitmap); Save();
@@ -45,6 +47,7 @@ public sealed class PinManager
     }
     public void Restore()
     {
+        hasSessionState = true;
         try
         {
             var p = Path.Combine(Paths.Pins, "pins.json"); if (!File.Exists(p)) return;
@@ -58,6 +61,7 @@ public sealed class PinManager
     }
     public void Save()
     {
+        if (!hasSessionState) return;
         AtomicFile.Write(Path.Combine(Paths.Pins, "pins.json"), JsonSerializer.Serialize(pins.Select(p => p.State), Settings.Json));
         var active = pins.Select(p => p.State.ImagePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var path in Directory.EnumerateFiles(Paths.Pins, "*.png"))
