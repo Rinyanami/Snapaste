@@ -21,6 +21,7 @@ public sealed class ImageDocument
         // A stored long PNG is decoded only for ordinary history/pin use with a bounded limit.
         var source = ReadBitmap(path); return new(source);
     }
+    public ImageDocument Fork() => original == null ? new ImageDocument(Width, Segments, Kind) : new ImageDocument(original, Kind);
     public static BitmapSource ReadBitmap(string path, int previewWidth = 0)
     {
         var bmp = new BitmapImage(); bmp.BeginInit(); bmp.CacheOption = BitmapCacheOption.OnLoad;
@@ -57,5 +58,11 @@ public sealed class ImageDocument
     {
         BitmapEncoder encoder = Path.GetExtension(path).ToLowerInvariant() switch { ".jpg" or ".jpeg" => new JpegBitmapEncoder { QualityLevel = 94 }, ".bmp" => new BmpBitmapEncoder(), _ => new PngBitmapEncoder() };
         encoder.Frames.Add(BitmapFrame.Create(bitmap)); using var f = File.Create(path); encoder.Save(f);
+    }
+    public static BitmapSource Detach(BitmapSource source)
+    {
+        var converted = source.Format == PixelFormats.Bgra32 || source.Format == PixelFormats.Pbgra32 || source.Format == PixelFormats.Bgr32 ? source : new FormatConvertedBitmap(source, PixelFormats.Pbgra32, null, 0);
+        int stride = converted.PixelWidth * 4; var bytes = new byte[stride * converted.PixelHeight]; converted.CopyPixels(bytes, stride, 0);
+        var bitmap = BitmapSource.Create(converted.PixelWidth, converted.PixelHeight, 96, 96, converted.Format, null, bytes, stride); bitmap.Freeze(); return bitmap;
     }
 }

@@ -70,7 +70,7 @@ public static class ScrollMatcher
         double secondCost = alternatives.Length == 0 ? best.Cost : alternatives.Min(s => s.Cost);
         double score = Math.Clamp(1 - best.Cost / 35, 0, 1), second = Math.Clamp(1 - secondCost / 35, 0, 1);
         double uniqueness = Math.Clamp((secondCost - best.Cost) / Math.Max(1.5, secondCost), 0, 1);
-        bool reliable = score >= sensitivity && uniqueness >= .16 && best.Texture >= 1.1 && secondCost - best.Cost >= .65;
+        bool reliable = score >= sensitivity && uniqueness >= .20 && best.Texture >= 1.1 && secondCost - best.Cost >= .20;
         var confidence = !reliable ? Confidence.Low : score >= .92 && uniqueness >= .38 ? Confidence.High : Confidence.Medium;
         return new(best.Offset, score, second, uniqueness, best.Texture, confidence, top, bottom);
     }
@@ -83,7 +83,7 @@ public static class ScrollMatcher
             for (int x = 0; x < FrameSample.Columns; x++) if (Math.Abs(a.Gray[y * FrameSample.Columns + x] - b.Gray[y * FrameSample.Columns + x]) < 5) equal++;
             if (equal >= FrameSample.Columns * .94) { last = i + 1; bad = 0; } else if (++bad >= 3) break;
         }
-        return Math.Max(0, last - 2);
+        return last;
     }
     private static (double Cost, double Texture) Cost(FrameSample a, FrameSample b, int offset, int top, int bottom, int step)
     {
@@ -106,6 +106,9 @@ public static class ScrollMatcher
             bands.Add((error / Math.Max(1, count), texture / Math.Max(1, count)));
         }
         // Discard two worst vertical strips: local overlays and animated content cannot dominate.
-        var accepted = bands.OrderBy(v => v.Error).Take(6).ToArray(); return (accepted.Average(v => v.Error), accepted.Average(v => v.Texture));
+        var ordered = bands.OrderBy(v => v.Error).ToArray();
+        // Retain some evidence from every strip. Dropping the text/number columns entirely
+        // would make repeated paragraphs with different row numbers indistinguishable.
+        return (ordered.Take(6).Average(v => v.Error) * .85 + ordered.Skip(6).Average(v => v.Error) * .15, bands.Average(v => v.Texture));
     }
 }

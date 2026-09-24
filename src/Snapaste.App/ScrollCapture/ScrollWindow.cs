@@ -13,7 +13,7 @@ public sealed class ScrollWindow : Window
     private bool completed;
     public ScrollWindow(ScrollSession session)
     {
-        this.session = session; Title = "Snapaste · 滚动截图"; Width = 302; Height = 610; MinWidth = 280; MinHeight = 350; Topmost = true; Ui.Setup(this);
+        this.session = session; Title = "Snapaste · 滚动截图"; Width = 302; Height = 610; MinWidth = 280; MinHeight = 350; Topmost = true; ShowActivated = false; Ui.Setup(this);
         var root = new DockPanel(); Content = root;
         var head = new StackPanel(); DockPanel.SetDock(head, Dock.Top); root.Children.Add(head);
         head.Children.Add(new TextBlock { Text = "滚动截图", FontSize = 17, FontWeight = FontWeights.SemiBold, Margin = new Thickness(12, 10, 12, 0) }); head.Children.Add(status);
@@ -38,13 +38,15 @@ public sealed class ScrollWindow : Window
         session.Updated += OnUpdated;
         SourceInitialized += (_, _) =>
         {
-            Native.ExcludeFromCapture(this);
+            session.ControlHandle = Native.Handle(this);
             var screen = System.Windows.Forms.Screen.FromPoint(new System.Drawing.Point((int)session.Region.X, (int)session.Region.Y)).WorkingArea;
             double dpi = Native.GetDpiForWindow(Native.Handle(this)) / 96d; double w = Width * dpi, h = Math.Min(Height * dpi, screen.Height);
             double x = session.Region.Right + 8; if (x + w > screen.Right) x = session.Region.Left - w - 8;
             if (x < screen.Left) x = screen.Right - w;
             Native.PlacePhysical(this, new Rect(x, Math.Clamp(session.Region.Top, screen.Top, screen.Bottom - h), w, h));
+            Native.SetWindowDisplayAffinity(Native.Handle(this), Native.Bounds(Native.Handle(this)).IntersectsWith(session.Region) ? 0x11u : 0u);
         };
+        LocationChanged += (_, _) => { if (IsLoaded) Native.SetWindowDisplayAffinity(Native.Handle(this), Native.Bounds(Native.Handle(this)).IntersectsWith(session.Region) ? 0x11u : 0u); };
         Loaded += async (_, _) => await session.Start();
         Closed += (_, _) => { session.Updated -= OnUpdated; if (!completed) session.Cancel(); };
     }
@@ -62,7 +64,7 @@ public sealed class ScrollWindow : Window
             var source = ImageDocument.ReadBitmap(segment.Path);
             var crop = new CroppedBitmap(source, new Int32Rect(0, segment.SourceY, source.PixelWidth, segment.Height));
             var thumbnail = new TransformedBitmap(crop, new ScaleTransform(260d / source.PixelWidth, 260d / source.PixelWidth)); thumbnail.Freeze();
-            var image = new Image { Source = thumbnail, Width = 260, Height = Math.Max(1, segment.Height * 260d / source.PixelWidth), Stretch = Stretch.Fill };
+            var image = new Image { Source = ImageDocument.Detach(thumbnail), Width = 260, Height = Math.Max(1, segment.Height * 260d / source.PixelWidth), Stretch = Stretch.Fill };
             if (i < thumbnails.Children.Count) { thumbnails.Children.RemoveAt(i); thumbnails.Children.Insert(i, image); rendered[i] = segment; }
             else { thumbnails.Children.Add(image); rendered.Add(segment); }
         }

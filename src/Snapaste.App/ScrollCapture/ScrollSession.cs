@@ -24,6 +24,7 @@ public sealed class ScrollSession : IDisposable
     private double wheelUnits = 3;
     public ScrollState State { get; private set; } = ScrollState.Idle;
     public Rect Region { get; }
+    public nint ControlHandle { get; set; }
     public bool Automatic { get; private set; }
     public int FixedTop { get; private set; }
     public int FixedBottom { get; private set; }
@@ -51,7 +52,7 @@ public sealed class ScrollSession : IDisposable
             {
                 await Task.Delay(150, cancel.Token);
                 if (State is ScrollState.Paused or ScrollState.Failed) continue;
-                if (!ValidateTarget()) { Pause("目标窗口、显示器或分辨率已改变。请完成当前截图或取消后重新框选。"); continue; }
+                if (!ValidateTarget()) { Pause("目标窗口被遮挡、最小化或位置/显示器已改变。请恢复原画面后继续，或完成当前截图。"); continue; }
                 int generation = epoch;
                 var bitmap = capture.Capture(Region); var sample = await Task.Run(() => new FrameSample(bitmap), cancel.Token);
                 if (generation != epoch || State == ScrollState.Paused) continue;
@@ -68,12 +69,12 @@ public sealed class ScrollSession : IDisposable
                     else
                     {
                         SetState(ScrollState.Matching, "正在分析重叠区域");
-                        var match = await Task.Run(() => ScrollMatcher.Match(reference!, sample, settings.MatchSensitivity, cancel.Token, TopOverride, BottomOverride), cancel.Token);
+                        var match = await Task.Run(() => ScrollMatcher.Match(reference!, sample, settings.MatchSensitivity, cancel.Token, TopOverride >= 0 ? TopOverride : frames.Count > 1 ? FixedTop : -1, BottomOverride >= 0 ? BottomOverride : frames.Count > 1 ? FixedBottom : -1), cancel.Token);
                         if (generation != epoch || State == ScrollState.Paused) continue;
                         LastMatch = match;
                         if (match.Confidence == Confidence.Low)
                         {
-                            pending = bitmap; pendingSample = sample; Automatic = false; SetState(ScrollState.Paused, UI.Strings.T("LowMatch")); Log.Error($"Scroll low match: offset={match.Offset} score={match.Score:F3} uniqueness={match.Uniqueness:F3}");
+                            pending = bitmap; pendingSample = sample; Automatic = false; SetState(ScrollState.Paused, UI.Strings.T("LowMatch")); Log.Error($"Scroll low match: offset={match.Offset} score={match.Score:F3} uniqueness={match.Uniqueness:F3} texture={match.Texture:F3} second={match.SecondBestScore:F3}");
                         }
                         else Accept(bitmap, sample, match, false);
                     }
@@ -92,7 +93,17 @@ public sealed class ScrollSession : IDisposable
         catch (OperationCanceledException) { }
         catch (Exception e) { Log.Error("Scroll session", e); Automatic = false; SetState(ScrollState.Failed, "滚动截图已停止：" + e.Message); }
     }
-    private bool ValidateTarget() => Native.Desktop == desktopBounds && (target == 0 || Native.IsWindow(target) && Native.IsWindowVisible(target) && !Native.IsIconic(target) && Native.Bounds(target) == targetBounds);
+    private bool ValidateTarget()
+    {
+        if (Native.Desktop != desktopBounds || target != 0 && (!Native.IsWindow(target) || !Native.IsWindowVisible(target) || Native.IsIconic(target) || Native.Bounds(target) != targetBounds)) return false;
+        if (target == 0) return true;
+        for (int y = 1; y <= 3; y++) for (int x = 1; x <= 3; x++)
+        {
+            var h = Native.GetAncestor(Native.WindowFromPoint(new Native.POINT((int)(Region.X + Region.Width * x / 4), (int)(Region.Y + Region.Height * y / 4))), 2);
+            if (h != target && h != ControlHandle) return false;
+        }
+        return true;
+    }
     private void Accept(BitmapSource bitmap, FrameSample sample, MatchMetadata match, bool manual)
     {
         SetState(ScrollState.Stitching, "正在拼接"); FixedTop = match.FixedTop; FixedBottom = match.FixedBottom;
@@ -140,7 +151,7 @@ public sealed class ScrollSession : IDisposable
     {
         if (pending == null || pendingSample == null) return;
         offset = Math.Clamp(offset, 1, (int)Region.Height - FixedBottom - Math.Max(1, FixedTop));
-        var match = new MatchMetadata(offset, 1, 0, 1, 1, Confidence.High, Math.Max(0, TopOverride), Math.Max(0, BottomOverride));
+        var match = new MatchMetadata(offset, 1, 0, 1, 1, Confidence.High, TopOverride >= 0 ? TopOverride : LastMatch?.FixedTop ?? FixedTop, BottomOverride >= 0 ? BottomOverride : LastMatch?.FixedBottom ?? FixedBottom);
         epoch++; Accept(pending, pendingSample, match, true);
     }
     public void Undo()

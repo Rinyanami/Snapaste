@@ -30,7 +30,7 @@ public sealed class CaptureOverlay : Window
         Ui.Setup(this); Content = root; surface = new OverlaySurface(this); root.Children.Add(surface); root.Children.Add(toolbar); toolbar.Visibility = Visibility.Collapsed;
         foreach (var tool in new[] { "Rectangle", "Ellipse", "Line", "Arrow", "Pen", "Highlighter", "Text", "Mosaic", "Blur", "Crop" }) { string t = tool; toolbar.Children.Add(Ui.Button(Strings.T(t), () => Finish(t))); }
         foreach (var action in new[] { "Scroll", "Pin", "Copy", "Save", "Edit" }) { string a = action; toolbar.Children.Add(Ui.Button(Strings.T(a), () => Finish(a))); }
-        SourceInitialized += (_, _) => { Native.PlacePhysical(this, screen); Native.ExcludeFromCapture(this); };
+        SourceInitialized += (_, _) => Native.PlacePhysical(this, screen);
         SizeChanged += (_, _) => { surface.Width = ActualWidth; surface.Height = ActualHeight; surface.InvalidateVisual(); };
         surface.MouseLeftButtonDown += Down; surface.MouseLeftButtonUp += Up; surface.MouseMove += Move;
         surface.MouseRightButtonDown += (_, _) => { if (selected.IsEmpty) Close(); else { selected = Rect.Empty; toolbar.Visibility = Visibility.Collapsed; surface.InvalidateVisual(); } };
@@ -95,11 +95,11 @@ public sealed class CaptureOverlay : Window
         var r = Local(selected); Canvas.SetLeft(toolbar, Math.Clamp(r.Right - size.Width, 0, Math.Max(0, ActualWidth - size.Width)));
         Canvas.SetTop(toolbar, r.Bottom + size.Height + 14 < ActualHeight ? r.Bottom + 10 : Math.Max(0, r.Top - size.Height - 10));
     }
-    private async void Key(object sender, KeyEventArgs e)
+    private void Key(object sender, KeyEventArgs e)
     {
         if (e.Key == System.Windows.Input.Key.Escape) { Close(); return; }
         if (e.Key == System.Windows.Input.Key.Tab) { detectionMode = (detectionMode + 1) % 3; candidate = Rect.Empty; e.Handled = true; surface.InvalidateVisual(); return; }
-        if (e.Key == System.Windows.Input.Key.C && Keyboard.Modifiers == ModifierKeys.None) { try { Clipboard.SetText(PixelColor(pointer).ToString()); } catch (Exception ex) { Ui.Error(ex); } return; }
+        if (e.Key == System.Windows.Input.Key.C && Keyboard.Modifiers == ModifierKeys.None) { try { var c = PixelColor(pointer); Clipboard.SetText($"#{c.R:X2}{c.G:X2}{c.B:X2}"); } catch (Exception ex) { Ui.Error(ex); } return; }
         if (selected.IsEmpty) return;
         if (e.Key == System.Windows.Input.Key.Enter || e.Key == System.Windows.Input.Key.C && Keyboard.Modifiers.HasFlag(ModifierKeys.Control)) { Finish("Copy"); return; }
         if (e.Key == System.Windows.Input.Key.S && Keyboard.Modifiers.HasFlag(ModifierKeys.Control)) { Finish("Save"); return; }
@@ -110,7 +110,6 @@ public sealed class CaptureOverlay : Window
             else { selected.Offset(dx, dy); selected = Clamp(selected); }
             PositionToolbar(); surface.InvalidateVisual(); e.Handled = true;
         }
-        await Task.CompletedTask;
     }
     private Color PixelColor(Point p)
     {
@@ -120,7 +119,8 @@ public sealed class CaptureOverlay : Window
     {
         if (selected.IsEmpty) return;
         var crop = new CroppedBitmap(desktop, new Int32Rect((int)(selected.X - screen.X), (int)(selected.Y - screen.Y), (int)selected.Width, (int)selected.Height)); crop.Freeze();
-        var rect = selected; Close(); Accepted?.Invoke(rect, crop, action, target);
+        var result = ImageDocument.Detach(crop);
+        var rect = selected; Close(); Accepted?.Invoke(rect, result, action, target);
     }
     private sealed class OverlaySurface(CaptureOverlay o) : FrameworkElement
     {
@@ -148,7 +148,7 @@ public sealed class CaptureOverlay : Window
                 RenderOptions.SetBitmapScalingMode(this, BitmapScalingMode.NearestNeighbor);
                 dc.DrawImage(new CroppedBitmap(o.desktop, new Int32Rect(px, py, 19, 19)), new Rect(x + 44, y + 8, 95, 95));
                 dc.DrawRectangle(null, new System.Windows.Media.Pen(Brushes.Red, 1), new Rect(x + 89, y + 53, 5, 5));
-                Label(dc, $"X {o.pointer.X:0}  Y {o.pointer.Y:0}\nRGB {color.R}, {color.G}, {color.B}  {color.ToString()[3..]}", new Point(x + 7, y + 108), 11);
+                Label(dc, $"X {o.pointer.X:0}  Y {o.pointer.Y:0}\nRGB {color.R}, {color.G}, {color.B}  #{color.R:X2}{color.G:X2}{color.B:X2}", new Point(x + 7, y + 108), 11);
             }
         }
         private void Label(DrawingContext dc, string value, Point point, double size)

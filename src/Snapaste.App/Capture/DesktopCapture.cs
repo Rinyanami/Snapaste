@@ -14,7 +14,13 @@ public sealed class DesktopCapture : ICaptureProvider
         using var bitmap = new Bitmap((int)rect.Width, (int)rect.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(bitmap))
         {
-            g.CopyFromScreen((int)rect.X, (int)rect.Y, 0, 0, bitmap.Size, CopyPixelOperation.SourceCopy | CopyPixelOperation.CaptureBlt);
+            var screenDc = Native.GetDC(0); var destinationDc = g.GetHdc();
+            try
+            {
+                if (!Native.BitBlt(destinationDc, 0, 0, bitmap.Width, bitmap.Height, screenDc, (int)rect.X, (int)rect.Y, 0x40CC0020))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "无法读取桌面画面，请检查屏幕是否锁定或会话已断开。");
+            }
+            finally { g.ReleaseHdc(destinationDc); Native.ReleaseDC(0, screenDc); }
             if (cursor)
             {
                 var ci = new Native.CURSORINFO { Size = Marshal.SizeOf<Native.CURSORINFO>() };

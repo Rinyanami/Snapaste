@@ -34,6 +34,9 @@ public static class Native
     [DllImport("user32.dll")] public static extern bool GetIconInfo(nint icon, out ICONINFO info);
     [DllImport("user32.dll")] public static extern bool DrawIconEx(nint dc, int x, int y, nint icon, int width, int height, uint step, nint brush, uint flags);
     [DllImport("gdi32.dll")] public static extern bool DeleteObject(nint h);
+    [DllImport("user32.dll")] public static extern nint GetDC(nint h);
+    [DllImport("user32.dll")] public static extern int ReleaseDC(nint h, nint dc);
+    [DllImport("gdi32.dll", SetLastError = true)] public static extern bool BitBlt(nint destination, int x, int y, int width, int height, nint source, int sourceX, int sourceY, uint operation);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] public static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint Type; public MOUSEINPUT Mouse; }
