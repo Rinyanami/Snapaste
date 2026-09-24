@@ -31,6 +31,15 @@ public static class ImageExport
         if (dialog.ShowDialog(owner) != true) return false;
         Save(document, dialog.FileName); return true;
     }
+    public static async Task<bool> SaveDialogAsync(EditDocument document, Settings settings, Window owner)
+    {
+        var ext = settings.DefaultFormat.ToLowerInvariant() == "jpeg" ? "jpg" : settings.DefaultFormat.ToLowerInvariant();
+        var dialog = new Microsoft.Win32.SaveFileDialog { FileName = $"Screenshot_{DateTime.Now:yyyy-MM-dd_HHmmss}.{ext}", Filter = "PNG 图片|*.png|JPEG 图片|*.jpg|BMP 图片|*.bmp", FilterIndex = ext == "jpg" ? 2 : ext == "bmp" ? 3 : 1, InitialDirectory = Directory.Exists(settings.SaveDirectory) ? settings.SaveDirectory : "", AddExtension = true };
+        if (dialog.ShowDialog(owner) != true) return false;
+        var snapshot = document.Fork(); owner.IsEnabled = false;
+        try { await RenderWorker.Run(() => Save(snapshot, dialog.FileName)); return true; }
+        finally { owner.IsEnabled = true; }
+    }
     public static async Task Copy(EditDocument document)
     {
         var bitmap = document.Raster(document.Crop);

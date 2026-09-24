@@ -10,6 +10,7 @@ public sealed class HistoryWindow : Window
         foreach (var entry in store.Entries())
         {
             var box = new StackPanel { Width = 230, Margin = new Thickness(10), Background = Brushes.White };
+            box.SetResourceReference(Panel.BackgroundProperty, "PanelBrush");
             box.Children.Add(new Image { Source = ImageDocument.ReadBitmap(entry.Thumbnail), Height = 160, Stretch = Stretch.Uniform });
             box.Children.Add(new TextBlock { Text = $"{entry.Created:MM-dd HH:mm:ss} · {(entry.Kind == "Scroll" ? "滚动" : "普通")}\n{entry.Width} × {entry.Height}", Margin = new Thickness(8) });
             var actions = new WrapPanel();

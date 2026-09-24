@@ -98,6 +98,7 @@ public sealed class EditDocument
     public List<Annotation> Annotations { get; private set; } = [];
     private readonly Stack<EditSnapshot> undo = new(), redo = new();
     public EditDocument(ImageDocument image) { Image = image; Crop = image.Bounds; }
+    public EditDocument Fork() => new(Image.Fork()) { Crop = Crop, Annotations = Annotations.Select(a => a.Clone()).ToList() };
     private EditSnapshot Snapshot() => new(Crop, Annotations.Select(a => a.Clone()).ToList());
     public void Checkpoint() { undo.Push(Snapshot()); redo.Clear(); }
     public void Undo() { if (undo.Count == 0) return; redo.Push(Snapshot()); Restore(undo.Pop()); }

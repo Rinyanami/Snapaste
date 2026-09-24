@@ -26,9 +26,10 @@ public sealed class HistoryStore
         }
         return result.OrderByDescending(e => e.Created).ToList();
     }
-    public void Add(EditDocument document)
+    public void Add(EditDocument document, Settings? configuration = null)
     {
-        if (!App.Current.Settings.HistoryEnabled) return;
+        var settings = configuration ?? App.Current.Settings;
+        if (!settings.HistoryEnabled) return;
         var entry = new HistoryEntry { Kind = document.Image.Kind, Width = (int)document.Crop.Width, Height = (int)document.Crop.Height };
         Directory.CreateDirectory(entry.DirectoryPath);
         for (int y = 0; y < entry.Height; y += 1024)
@@ -38,12 +39,12 @@ public sealed class HistoryStore
             entry.Segments.Add(new(path, 0, rows, y));
         }
         ImageDocument.SaveBitmap(document.Raster(document.Crop, Math.Min(1, Math.Min(240d / entry.Width, 400d / entry.Height))), entry.Thumbnail);
-        AtomicFile.Write(Path.Combine(entry.DirectoryPath, "entry.json"), JsonSerializer.Serialize(entry, Settings.Json)); Clean();
+        AtomicFile.Write(Path.Combine(entry.DirectoryPath, "entry.json"), JsonSerializer.Serialize(entry, Settings.Json)); Clean(false, settings);
     }
-    public void Clean(bool all = false)
+    public void Clean(bool all = false, Settings? configuration = null)
     {
         var entries = Entries(); long size = entries.Sum(e => Directory.EnumerateFiles(e.DirectoryPath).Sum(f => new FileInfo(f).Length));
-        int count = entries.Count; var s = App.Current.Settings;
+        int count = entries.Count; var s = configuration ?? App.Current.Settings;
         foreach (var entry in entries.AsEnumerable().Reverse())
         {
             if (!all && count <= s.HistoryCount && size <= (long)s.HistoryMegabytes * 1024 * 1024) break;

@@ -39,7 +39,16 @@ public static class Ui
     public static void Setup(Window window)
     {
         window.FontFamily = new FontFamily("Microsoft YaHei UI"); window.FontSize = 12;
-        window.Background = new SolidColorBrush(Color.FromRgb(247, 248, 250));
+        window.SetResourceReference(Window.BackgroundProperty, "SurfaceBrush");
+        window.SetResourceReference(Window.ForegroundProperty, "TextBrush");
         window.UseLayoutRounding = true;
+    }
+    public static void Theme(string value)
+    {
+        bool dark = value == "Dark";
+        if (value == "System") { using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"); dark = key?.GetValue("AppsUseLightTheme") is int n && n == 0; }
+        var colors = dark ? new[] { "#20252D", "#2B323D", "#F0F3F8", "#455268", "#304967" } : new[] { "#F6F8FB", "#FFFFFF", "#202B3C", "#D7DFEA", "#E8F1FD" };
+        var names = new[] { "SurfaceBrush", "PanelBrush", "TextBrush", "BorderBrush", "HoverBrush" };
+        for (int i = 0; i < names.Length; i++) Application.Current.Resources[names[i]] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(colors[i]));
     }
 }

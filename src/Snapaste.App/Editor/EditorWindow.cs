@@ -29,7 +29,7 @@ public sealed class EditorWindow : Window
         var size = new Slider { Minimum = 2, Maximum = 40, Value = 5, Width = 105, VerticalAlignment = VerticalAlignment.Center }; size.ValueChanged += (_, _) => { surface.InkSize = size.Value; }; options.Children.Add(size);
         options.Children.Add(Ui.Button("−", () => Zoom(surface.Zoom / 1.25))); options.Children.Add(Ui.Button("+", () => Zoom(surface.Zoom * 1.25))); options.Children.Add(Ui.Button("100%", () => Zoom(1))); options.Children.Add(Ui.Button("适合宽度", Fit));
         options.Children.Add(Ui.Button(Strings.T("Pin"), () => { Completed?.Invoke(Document); PinRequested?.Invoke(Document); Close(); }));
-        options.Children.Add(Ui.Button(Strings.T("Save"), () => { if (ImageExport.SaveDialog(Document, App.Current.Settings, this)) Completed?.Invoke(Document); }));
+        options.Children.Add(Ui.Button(Strings.T("Save"), Save));
         options.Children.Add(Ui.Button(Strings.T("Copy"), () => Copy(false)));
         options.Children.Add(Ui.Button(Strings.T("Done"), () => Copy(true)));
         DockPanel.SetDock(status, Dock.Bottom); dock.Children.Add(status); dock.Children.Add(viewport);
@@ -42,7 +42,7 @@ public sealed class EditorWindow : Window
             {
                 if (e.Key == Key.Z) { Document.Undo(); Update(); e.Handled = true; }
                 if (e.Key == Key.Y) { Document.Redo(); Update(); e.Handled = true; }
-                if (e.Key == Key.S) { if (ImageExport.SaveDialog(Document, App.Current.Settings, this)) Completed?.Invoke(Document); e.Handled = true; }
+                if (e.Key == Key.S) { Save(); e.Handled = true; }
                 if (e.Key == Key.C) { Copy(false); e.Handled = true; }
             }
             else if (e.Key == Key.Delete) { surface.Delete(); Update(); }
@@ -53,6 +53,11 @@ public sealed class EditorWindow : Window
     private async void Copy(bool close)
     {
         try { await ImageExport.Copy(Document); Completed?.Invoke(Document); status.Text = "已复制到剪贴板"; if (close) Close(); } catch (Exception e) { Ui.Error(e); }
+    }
+    private async void Save()
+    {
+        try { status.Text = "正在导出图片…"; if (await ImageExport.SaveDialogAsync(Document, App.Current.Settings, this)) { Completed?.Invoke(Document); status.Text = "图片已保存"; } else UpdateStatus(); }
+        catch (Exception e) { Ui.Error(e); UpdateStatus(); }
     }
     private void Fit() => Zoom(Math.Min(1, Math.Max(.05, (viewport.ActualWidth - 28) / Document.Crop.Width)));
     private void Zoom(double value) { surface.Zoom = Math.Clamp(value, .02, 8); Update(); }

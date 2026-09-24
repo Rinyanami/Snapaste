@@ -56,7 +56,13 @@ public sealed class PinManager
         }
         catch (Exception e) when (e is IOException or JsonException) { Log.Error("Pin manifest", e); }
     }
-    public void Save() => AtomicFile.Write(Path.Combine(Paths.Pins, "pins.json"), JsonSerializer.Serialize(pins.Select(p => p.State), Settings.Json));
+    public void Save()
+    {
+        AtomicFile.Write(Path.Combine(Paths.Pins, "pins.json"), JsonSerializer.Serialize(pins.Select(p => p.State), Settings.Json));
+        var active = pins.Select(p => p.State.ImagePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in Directory.EnumerateFiles(Paths.Pins, "*.png"))
+            if (!active.Contains(path)) { try { File.Delete(path); } catch (IOException e) { Log.Error("Pin cache cleanup", e); } }
+    }
     public void ShowAll() { foreach (var p in pins) p.Show(); }
     public void HideAll() { foreach (var p in pins) p.Hide(); }
     public void Recover() { foreach (var p in pins) { p.ClickThrough = false; p.Show(); p.KeepReachable(); } }
@@ -110,6 +116,8 @@ public sealed class PinWindow : Window
         Item(Strings.T("FlipV"), () => { State.FlipV = !State.FlipV; UpdateImage(); Changed?.Invoke(); });
         Item(Strings.T("Reset"), () => { State.Scale = 1; State.Rotation = 0; State.FlipH = State.FlipV = false; UpdateImage(); Reposition(); Changed?.Invoke(); });
         Item(Strings.T("AlwaysTop"), () => { State.Topmost = Topmost = !Topmost; Changed?.Invoke(); });
+        Item("透明度 +10%", () => { State.Opacity = Opacity = Math.Clamp(Opacity + .1, .15, 1); Changed?.Invoke(); });
+        Item("透明度 −10%", () => { State.Opacity = Opacity = Math.Clamp(Opacity - .1, .15, 1); Changed?.Invoke(); });
         Item(Strings.T("ClickThrough") + " · " + App.Current.Settings.RecoverKey + " 恢复", () => ClickThrough = !ClickThrough);
         Item(Strings.T("Close"), Close); ContextMenu = menu;
     }

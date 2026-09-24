@@ -17,9 +17,8 @@ public sealed class SettingsWindow : Window
         var general = Tab("General");
         general.Children.Add(new TextBlock { Text = "Snapaste 0.1 · 本地截图与滚动长图\n无账号、无遥测，图片保存在本机。\n启动后驻留托盘，关闭设置不会退出。", Margin = new Thickness(0, 0, 0, 18), TextWrapping = TextWrapping.Wrap });
         Check(general, "开机启动", draft.StartWithWindows, v => draft.StartWithWindows = v);
+        Choice(general, "主题（Light / Dark / System）", ["Light", "Dark", "System"], draft.Theme, v => draft.Theme = v);
         Text(general, "默认保存目录", draft.SaveDirectory, v => draft.SaveDirectory = v);
-        var browse = Ui.Button("选择保存目录…", () => { var d = new Microsoft.Win32.OpenFolderDialog(); if (d.ShowDialog(this) == true) { draft.SaveDirectory = d.FolderName; MessageBox.Show("目录已选择；请勿在上方文本框再次修改，保存后生效。", "Snapaste"); } });
-        // Directory remains editable and validated on save.
         general.Children.Add(new TextBlock { Text = "配置与缓存：" + Paths.Data, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 16, 0, 0), Foreground = Brushes.DimGray });
         var hotkeys = Tab("Hotkeys");
         Text(hotkeys, "普通截图", draft.CaptureKey, v => draft.CaptureKey = v); Text(hotkeys, "贴图", draft.PinKey, v => draft.PinKey = v); Text(hotkeys, "滚动截图", draft.ScrollKey, v => draft.ScrollKey = v); Text(hotkeys, "恢复全部穿透贴图", draft.RecoverKey, v => draft.RecoverKey = v);
