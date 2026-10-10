@@ -16,10 +16,12 @@ public sealed class App : Application
     private Mutex? instance;
     private readonly CancellationTokenSource lifetime = new();
     private Forms.NotifyIcon? tray;
+    private System.Drawing.Icon? trayIcon;
     private Hotkeys? hotkeys;
     public Settings Settings { get; private set; } = Settings.Load();
     public static new App Current => (App)Application.Current;
     private Window? settingsWindow;
+    private HistoryWindow? historyWindow;
     private CaptureOverlay? overlay;
     private ScrollWindow? scrollWindow;
     private readonly DesktopCapture captureProvider = new();
@@ -87,7 +89,8 @@ public sealed class App : Application
         Add("ShowPins", ShowPins); Add("HidePins", HidePins); Add("RecoverPins", RecoverPins);
         Add("ClosePins", () => pins?.CloseAll());
         Add("Settings", ShowSettings); Add("Exit", ExitSafely);
-        tray = new Forms.NotifyIcon { Text = "Snapaste · F1 截图 · F3 贴图", Icon = System.Drawing.SystemIcons.Application, ContextMenuStrip = menu, Visible = true };
+        trayIcon = BrandIcon.Tray();
+        tray = new Forms.NotifyIcon { Text = $"Snapaste · {Settings.CaptureKey} 截图 · {Settings.PinKey} 贴图", Icon = trayIcon, ContextMenuStrip = menu, Visible = true };
         tray.DoubleClick += (_, _) => Dispatcher.BeginInvoke(() => Capture(false));
     }
     public void ConfigureHotkeys()
@@ -98,7 +101,7 @@ public sealed class App : Application
     public void ShowSettings()
     {
         if (settingsWindow == null) { settingsWindow = new SettingsWindow(); settingsWindow.Closed += (_, _) => settingsWindow = null; }
-        settingsWindow.Show(); settingsWindow.Activate();
+        settingsWindow.Show(); if (settingsWindow.WindowState == WindowState.Minimized) settingsWindow.WindowState = WindowState.Normal; settingsWindow.Activate();
     }
     public void ApplySettings(Settings settings)
     {
@@ -109,6 +112,7 @@ public sealed class App : Application
             using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run");
             if (settings.StartWithWindows) key.SetValue("Snapaste", "\"" + Environment.ProcessPath + "\""); else key.DeleteValue("Snapaste", false);
             settings.Save(); Settings = settings; Ui.Theme(settings.Theme); History.Clean();
+            if (tray != null) tray.Text = $"Snapaste · {settings.CaptureKey} 截图 · {settings.PinKey} 贴图";
         }
         catch { Settings = previous; ConfigureHotkeys(); throw; }
     }
@@ -186,12 +190,17 @@ public sealed class App : Application
         }
         catch (Exception e) { Ui.Error(e); }
     }
-    public void ShowHistory() => new HistoryWindow(History).Show();
+    public void ShowHistory()
+    {
+        if (historyWindow == null) { historyWindow = new HistoryWindow(History); historyWindow.Closed += (_, _) => historyWindow = null; }
+        else historyWindow.Reload();
+        historyWindow.Show(); if (historyWindow.WindowState == WindowState.Minimized) historyWindow.WindowState = WindowState.Normal; historyWindow.Activate();
+    }
     public void ShowPins() => pins?.ShowAll();
     public void HidePins() => pins?.HideAll();
     public void RecoverPins() => pins?.Recover();
     protected override void OnExit(ExitEventArgs e)
     {
-        lifetime.Cancel(); pins?.Exit(); hotkeys?.Dispose(); tray?.Dispose(); instance?.Dispose(); base.OnExit(e);
+        lifetime.Cancel(); pins?.Exit(); hotkeys?.Dispose(); tray?.Dispose(); trayIcon?.Dispose(); instance?.Dispose(); base.OnExit(e);
     }
 }

@@ -38,7 +38,9 @@ public sealed class HistoryStore
             ImageDocument.SaveBitmap(document.Raster(new Rect(document.Crop.X, document.Crop.Y + y, entry.Width, rows)), path);
             entry.Segments.Add(new(path, 0, rows, y));
         }
-        ImageDocument.SaveBitmap(document.Raster(document.Crop, Math.Min(1, Math.Min(240d / entry.Width, 400d / entry.Height))), entry.Thumbnail);
+        // A readable excerpt is more useful than a one-pixel-wide thumbnail of a very long image.
+        var preview = new Rect(document.Crop.X, document.Crop.Y, document.Crop.Width, Math.Min(document.Crop.Height, document.Crop.Width * .72));
+        ImageDocument.SaveBitmap(document.Raster(preview, Math.Min(1, 320d / entry.Width)), entry.Thumbnail);
         AtomicFile.Write(Path.Combine(entry.DirectoryPath, "entry.json"), JsonSerializer.Serialize(entry, Settings.Json)); Clean(false, settings);
     }
     public void Clean(bool all = false, Settings? configuration = null)

@@ -13,7 +13,8 @@ public sealed class CaptureOverlay : Window
     private readonly WindowDetector detector = new();
     private readonly OverlaySurface surface;
     private readonly Canvas root = new();
-    private readonly WrapPanel toolbar = new() { Background = Brushes.White, MaxWidth = 880 };
+    private readonly Border toolbar;
+    private readonly WrapPanel toolbarItems = new() { MaxWidth = 740 };
     private Rect selected = Rect.Empty, candidate = Rect.Empty, initial;
     private Point start, pointer;
     private bool dragging;
@@ -27,12 +28,19 @@ public sealed class CaptureOverlay : Window
         this.desktop = desktop; this.screen = screen; this.settings = settings; scrollMode = scroll;
         detectionMode = settings.UiElements ? 0 : settings.AutoWindow ? 1 : 2;
         Title = "Snapaste · 选区"; WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; ShowInTaskbar = false; Topmost = true; Background = Brushes.Black; Cursor = Cursors.Cross;
-        Ui.Setup(this); Content = root; surface = new OverlaySurface(this); root.Children.Add(surface); root.Children.Add(toolbar); toolbar.Visibility = Visibility.Collapsed;
-        foreach (var tool in new[] { "Rectangle", "Ellipse", "Line", "Arrow", "Pen", "Highlighter", "Text", "Mosaic", "Blur", "Crop" }) { string t = tool; toolbar.Children.Add(Ui.Button(Strings.T(t), () => Finish(t))); }
-        foreach (var action in new[] { "Scroll", "Pin", "Copy", "Save", "Edit" }) { string a = action; toolbar.Children.Add(Ui.Button(Strings.T(a), () => Finish(a))); }
+        Ui.Setup(this); Content = root; surface = new OverlaySurface(this); toolbar = Ui.Card(toolbarItems, 5, true); root.Children.Add(surface); root.Children.Add(toolbar); toolbar.Visibility = Visibility.Collapsed;
+        foreach (var tool in new[] { "Rectangle", "Ellipse", "Line", "Arrow", "Pen", "Highlighter", "Text", "Mosaic", "Blur", "Crop", "Color" }) { string t = tool; toolbarItems.Children.Add(Ui.Tool(t, Strings.T(t), () => Finish(t), "进入编辑 · " + Strings.T(t))); }
+        toolbarItems.Children.Add(Ui.Divider());
+        toolbarItems.Children.Add(Ui.Action("Scroll", Strings.T("Scroll"), () => Finish("Scroll")));
+        toolbarItems.Children.Add(Ui.Tool("Pin", Strings.T("Pin"), () => Finish("Pin")));
+        toolbarItems.Children.Add(Ui.Tool("Save", Strings.T("Save"), () => Finish("Save"), "保存 · Ctrl+S"));
+        toolbarItems.Children.Add(Ui.Tool("Edit", Strings.T("Edit"), () => Finish("Edit"), "进入编辑 · 双击选区"));
+        toolbarItems.Children.Add(Ui.Action("Copy", Strings.T("Copy"), () => Finish("Copy"), true, "复制并完成 · Enter"));
+        foreach (var button in toolbarItems.Children.OfType<Button>().Where(b => b.Content is Viewbox)) { button.Width = 32; button.Height = 32; button.MinHeight = 32; button.Padding = new Thickness(6); button.Margin = new Thickness(1); }
         SourceInitialized += (_, _) => Native.PlacePhysical(this, screen);
         SizeChanged += (_, _) => { surface.Width = ActualWidth; surface.Height = ActualHeight; surface.InvalidateVisual(); };
         surface.MouseLeftButtonDown += Down; surface.MouseLeftButtonUp += Up; surface.MouseMove += Move;
+        surface.MouseLeave += (_, _) => surface.InvalidateVisual();
         surface.MouseRightButtonDown += (_, _) => { if (selected.IsEmpty) Close(); else { selected = Rect.Empty; toolbar.Visibility = Visibility.Collapsed; surface.InvalidateVisual(); } };
         PreviewKeyDown += Key;
         Loaded += (_, _) => { Activate(); Focus(); };
@@ -76,6 +84,8 @@ public sealed class CaptureOverlay : Window
         {
             lastDetection = DateTime.UtcNow; (candidate, target) = detector.Find(pointer, detectionMode == 0); candidate.Intersect(screen);
         }
+        int hover = Hit(pointer);
+        surface.Cursor = hover switch { -1 => Cursors.SizeAll, 0 or 4 => Cursors.SizeNWSE, 2 or 6 => Cursors.SizeNESW, 1 or 5 => Cursors.SizeNS, 3 or 7 => Cursors.SizeWE, _ => Cursors.Cross };
         surface.InvalidateVisual();
     }
     private Rect Normalize(Point p, Point q) => Rect.Intersect(new Rect(new Point(Math.Min(p.X, q.X), Math.Min(p.Y, q.Y)), new Point(Math.Max(p.X, q.X), Math.Max(p.Y, q.Y))), screen);
@@ -137,8 +147,9 @@ public sealed class CaptureOverlay : Window
                 if (!o.selected.IsEmpty) foreach (var p in o.Handles(r)) dc.DrawRectangle(Brushes.White, new System.Windows.Media.Pen(Ui.Accent, 1), new Rect(p.X - 3, p.Y - 3, 6, 6));
                 Label(dc, $"{selection.Width:0} × {selection.Height:0}", new Point(r.Left, Math.Max(0, r.Top - 26)), 12);
             }
-            Label(dc, Strings.T("OverlayHint") + "  [" + new[] { "控件", "窗口", "自由" }[o.detectionMode] + "]", new Point(18, 16), 12);
-            if (o.settings.Magnifier && !o.pointer.Equals(default(Point)))
+            var hint = o.selected.IsEmpty ? (o.scrollMode ? "框选滚动内容，松开开始捕获" : "拖动框选 · 点击选窗口") + "   Tab 切换识别   Esc 取消" : "拖动边界微调   Enter 复制   双击编辑   C 取色   Esc 取消";
+            Label(dc, hint + "  ·  " + new[] { "控件", "窗口", "自由" }[o.detectionMode], new Point(22, 20), 12);
+            if (o.settings.Magnifier && o.surface.IsMouseOver && !o.pointer.Equals(default(Point)))
             {
                 var p = o.PointFromScreen(o.pointer); var color = o.PixelColor(o.pointer); double x = p.X + 28, y = p.Y + 28;
                 if (x + 184 > ActualWidth) x = p.X - 204; if (y + 170 > ActualHeight) y = p.Y - 184;

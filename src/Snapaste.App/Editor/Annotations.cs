@@ -97,6 +97,8 @@ public sealed class EditDocument
     public Rect Crop { get; set; }
     public List<Annotation> Annotations { get; private set; } = [];
     private readonly Stack<EditSnapshot> undo = new(), redo = new();
+    public bool CanUndo => undo.Count > 0;
+    public bool CanRedo => redo.Count > 0;
     public EditDocument(ImageDocument image) { Image = image; Crop = image.Bounds; }
     public EditDocument Fork() => new(Image.Fork()) { Crop = Crop, Annotations = Annotations.Select(a => a.Clone()).ToList() };
     private EditSnapshot Snapshot() => new(Crop, Annotations.Select(a => a.Clone()).ToList());

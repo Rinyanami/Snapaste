@@ -12,5 +12,5 @@ if ($Portable) {
     if ($LASTEXITCODE -ne 0) { throw 'Publish failed' }
     Copy-Item README.md artifacts/Snapaste-portable/README.md -Force
     Copy-Item VALIDATION.md artifacts/Snapaste-portable/VALIDATION.md -Force
-    Compress-Archive -LiteralPath artifacts/Snapaste-portable -DestinationPath artifacts/Snapaste-0.1.0-win-x64.zip -Force
+    Compress-Archive -LiteralPath artifacts/Snapaste-portable -DestinationPath artifacts/Snapaste-0.2.0-win-x64.zip -Force
 }

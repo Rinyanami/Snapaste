@@ -26,29 +26,3 @@ public static class Strings
     };
     public static string T(string key) => Zh.GetValueOrDefault(key, key);
 }
-public static class Ui
-{
-    public static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(29, 121, 224));
-    public static Button Button(string label, Action action, string? hint = null)
-    {
-        var b = new Button { Content = label, Margin = new Thickness(3), Padding = new Thickness(9, 5, 9, 5), MinHeight = 30, ToolTip = hint ?? label };
-        b.Click += (_, _) => { try { action(); } catch (Exception e) { Error(e); } };
-        return b;
-    }
-    public static void Error(Exception e) { Core.Log.Error("UI", e); MessageBox.Show(e.Message, Strings.T("Error"), MessageBoxButton.OK, MessageBoxImage.Warning); }
-    public static void Setup(Window window)
-    {
-        window.FontFamily = new FontFamily("Microsoft YaHei UI"); window.FontSize = 12;
-        window.SetResourceReference(Window.BackgroundProperty, "SurfaceBrush");
-        window.SetResourceReference(Window.ForegroundProperty, "TextBrush");
-        window.UseLayoutRounding = true;
-    }
-    public static void Theme(string value)
-    {
-        bool dark = value == "Dark";
-        if (value == "System") { using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"); dark = key?.GetValue("AppsUseLightTheme") is int n && n == 0; }
-        var colors = dark ? new[] { "#20252D", "#2B323D", "#F0F3F8", "#455268", "#304967" } : new[] { "#F6F8FB", "#FFFFFF", "#202B3C", "#D7DFEA", "#E8F1FD" };
-        var names = new[] { "SurfaceBrush", "PanelBrush", "TextBrush", "BorderBrush", "HoverBrush" };
-        for (int i = 0; i < names.Length; i++) Application.Current.Resources[names[i]] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(colors[i]));
-    }
-}

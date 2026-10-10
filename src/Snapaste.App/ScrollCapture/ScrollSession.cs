@@ -150,8 +150,9 @@ public sealed class ScrollSession : IDisposable
     public void Manual(int offset)
     {
         if (pending == null || pendingSample == null) return;
-        offset = Math.Clamp(offset, 1, (int)Region.Height - FixedBottom - Math.Max(1, FixedTop));
-        var match = new MatchMetadata(offset, 1, 0, 1, 1, Confidence.High, TopOverride >= 0 ? TopOverride : LastMatch?.FixedTop ?? FixedTop, BottomOverride >= 0 ? BottomOverride : LastMatch?.FixedBottom ?? FixedBottom);
+        int top = TopOverride >= 0 ? TopOverride : LastMatch?.FixedTop ?? FixedTop, bottom = BottomOverride >= 0 ? BottomOverride : LastMatch?.FixedBottom ?? FixedBottom;
+        offset = Math.Clamp(offset, 1, (int)Region.Height - bottom - Math.Max(1, top));
+        var match = new MatchMetadata(offset, 1, 0, 1, 1, Confidence.High, top, bottom);
         epoch++; Accept(pending, pendingSample, match, true);
     }
     public void Undo()
