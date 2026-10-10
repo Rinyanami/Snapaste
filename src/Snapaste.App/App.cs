@@ -123,8 +123,9 @@ public sealed class App : Application
         {
             var bounds = Native.Desktop; var bitmap = captureProvider.Capture(bounds, Settings.IncludeCursor);
             overlay = new CaptureOverlay(bitmap, bounds, Settings, scroll);
+            var captureOverlay = overlay;
             overlay.Closed += (_, _) => overlay = null;
-            overlay.Accepted += async (rect, image, action, target) =>
+            overlay.Accepted += async (rect, doc, action, target) =>
             {
                 try
                 {
@@ -134,15 +135,14 @@ public sealed class App : Application
                         if (target == 0) { var center = new Native.POINT((int)(rect.X + rect.Width / 2), (int)(rect.Y + rect.Height / 2)); target = Native.GetAncestor(Native.WindowFromPoint(center), 2); }
                         if (target != 0) Native.SetForegroundWindow(target);
                         var session = new ScrollSession(rect, target, Settings, captureProvider); session.Finished += result => Edit(result);
-                        scrollWindow = new ScrollWindow(session); scrollWindow.Closed += (_, _) => scrollWindow = null; scrollWindow.Show(); return;
+                        scrollWindow = new ScrollWindow(session); scrollWindow.Closed += (_, _) => scrollWindow = null; scrollWindow.Show(); return true;
                     }
-                    var doc = new EditDocument(new ImageDocument(image));
                     if (action == "Copy") { await ImageExport.Copy(doc); Remember(doc); }
-                    else if (action == "Save") { if (ImageExport.SaveDialog(doc, Settings)) Remember(doc); }
+                    else if (action == "Save") { if (!await ImageExport.SaveDialogAsync(doc, Settings, captureOverlay)) return false; Remember(doc); }
                     else if (action == "Pin") { PinDocument(doc); Remember(doc); }
-                    else Edit(doc.Image, Enum.TryParse<Tool>(action, out var t) ? t : Tool.Select);
+                    return true;
                 }
-                catch (Exception ex) { Ui.Error(ex); }
+                catch (Exception ex) { Ui.Error(ex, captureOverlay); return false; }
             };
             overlay.Show();
         }

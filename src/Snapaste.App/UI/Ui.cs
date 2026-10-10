@@ -17,7 +17,7 @@ public static class Ui
         var button = new Button { Content = label, Margin = new Thickness(3), ToolTip = hint ?? label };
         AutomationProperties.SetName(button, label);
         ToolTipService.SetInitialShowDelay(button, 450);
-        button.Click += (_, _) => { try { action(); } catch (Exception e) { Error(e); } };
+        button.Click += (_, _) => { try { action(); } catch (Exception e) { Error(e, Window.GetWindow(button)); } };
         return button;
     }
     public static Button Action(string icon, string label, Action action, bool primary = false, string? hint = null)
@@ -45,7 +45,12 @@ public static class Ui
         path.SetBinding(System.Windows.Shapes.Shape.StrokeProperty, new Binding("Foreground") { RelativeSource = new RelativeSource(RelativeSourceMode.FindAncestor, typeof(Control), 1), FallbackValue = Accent });
         var canvas = new Canvas { Width = 20, Height = 20 }; canvas.Children.Add(path); return new Viewbox { Child = canvas, Width = size, Height = size, VerticalAlignment = VerticalAlignment.Center };
     }
-    public static void Error(Exception e) { Core.Log.Error("UI", e); MessageBox.Show(e.Message, Strings.T("Error"), MessageBoxButton.OK, MessageBoxImage.Warning); }
+    public static void Error(Exception e, Window? owner = null)
+    {
+        Core.Log.Error("UI", e);
+        if (owner?.IsVisible == true) MessageBox.Show(owner, e.Message, Strings.T("Error"), MessageBoxButton.OK, MessageBoxImage.Warning);
+        else MessageBox.Show(e.Message, Strings.T("Error"), MessageBoxButton.OK, MessageBoxImage.Warning);
+    }
     public static void Setup(Window window)
     {
         window.FontFamily = new FontFamily("Microsoft YaHei UI"); window.FontSize = 12;

@@ -8,9 +8,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Restore failed' }
 & $dotnet build Snapaste.sln -c Release --no-restore
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 if ($Portable) {
+    $projectVersion = ([xml](Get-Content -LiteralPath 'src/Snapaste.App/Snapaste.App.csproj' -Raw)).Project.PropertyGroup.Version
     & $dotnet publish src/Snapaste.App/Snapaste.App.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o artifacts/Snapaste-portable
     if ($LASTEXITCODE -ne 0) { throw 'Publish failed' }
     Copy-Item README.md artifacts/Snapaste-portable/README.md -Force
     Copy-Item VALIDATION.md artifacts/Snapaste-portable/VALIDATION.md -Force
-    Compress-Archive -LiteralPath artifacts/Snapaste-portable -DestinationPath artifacts/Snapaste-0.2.0-win-x64.zip -Force
+    Compress-Archive -LiteralPath artifacts/Snapaste-portable -DestinationPath "artifacts/Snapaste-$projectVersion-win-x64.zip" -Force
 }

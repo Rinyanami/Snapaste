@@ -63,7 +63,7 @@ public sealed class SettingsWindow : Window
         var output = Group(capture, "截图内容与输出");
         Check(output, "包含鼠标指针", "将捕获时的鼠标指针保留在图片中", draft.IncludeCursor, v => draft.IncludeCursor = v);
         Choice(output, "默认图片格式", "PNG 保留清晰文字，JPEG 适合照片", ["PNG", "JPEG", "BMP"], ["PNG", "JPEG", "BMP"], draft.DefaultFormat, v => draft.DefaultFormat = v);
-        Notice(capture, "Enter 复制并完成 · 双击选区进入编辑 · 方向键微调边界。");
+        Notice(capture, Strings.T("CaptureFlowHint"));
         var pins = Page("Pins", "让参考图留在手边，调整起来也轻松。");
         var behavior = Group(pins, "窗口行为");
         Check(behavior, "恢复上次的贴图", "下次启动时恢复图片、位置和外观", draft.RestorePins, v => draft.RestorePins = v);

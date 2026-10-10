@@ -108,12 +108,21 @@ public sealed class EditorSurface : FrameworkElement
     public double InkSize { get; set; } = 5;
     public double Zoom { get; set; } = 1;
     public Rect Visible { get; set; } = new(0, 0, 2000, 2000);
+    // The desktop overlay supplies its own frozen background; editing remains shared.
+    public bool DrawBaseImage { get; set; } = true;
+    public Annotation? HiddenAnnotation { get; set; }
+    public string TextFont { get; set; } = "Microsoft YaHei UI";
+    public double TextSize { get; set; } = 24;
+    public bool TextBold { get; set; }
+    public bool TextBackground { get; set; }
     private Annotation? active, selected;
     private Point start, last;
     private bool resize;
     private Rect cropDrag = Rect.Empty;
     public bool HasSelection => selected != null && document.Annotations.Contains(selected);
     public event Action? Changed;
+    public event Action<Annotation, bool>? TextRequested;
+    public event Action<MouseButtonEventArgs>? EmptySelectionDown;
     public EditorSurface(EditDocument document)
     {
         this.document = document; Focusable = true; Cursor = Cursors.Cross;
@@ -121,6 +130,12 @@ public sealed class EditorSurface : FrameworkElement
     }
     private Point Pixel(MouseEventArgs e) { var p = e.GetPosition(this); return new(Math.Clamp(p.X / Zoom + document.Crop.X, document.Crop.Left, document.Crop.Right), Math.Clamp(p.Y / Zoom + document.Crop.Y, document.Crop.Top, document.Crop.Bottom)); }
     public void Delete() { if (selected != null && document.Annotations.Contains(selected)) { document.Checkpoint(); document.Annotations.Remove(selected); selected = null; InvalidateVisual(); Changed?.Invoke(); } }
+    public void ClearSelection() { active = selected = null; InvalidateVisual(); }
+    public bool MoveSelection(Vector delta)
+    {
+        if (!HasSelection) return false;
+        document.Checkpoint(); selected!.Translate(delta); InvalidateVisual(); Changed?.Invoke(); return true;
+    }
     private void Down(object sender, MouseButtonEventArgs e)
     {
         Focus(); start = last = Pixel(e); cropDrag = Rect.Empty;
@@ -130,13 +145,14 @@ public sealed class EditorSurface : FrameworkElement
         }
         if (CurrentTool == Tool.Select)
         {
-            resize = selected != null && (selected.Bounds.BottomRight - start).Length < 12 / Zoom;
+            resize = HasSelection && (selected!.Bounds.BottomRight - start).Length < 12 / Zoom;
             if (!resize) selected = document.Annotations.LastOrDefault(a => { var r = a.Bounds; r.Inflate(8 / Zoom, 8 / Zoom); return r.Contains(start); });
             if (selected != null)
             {
                 if (e.ClickCount == 2 && selected.Kind == Tool.Text) { EditText(selected, false); return; }
                 document.Checkpoint(); active = selected;
             }
+            else if (EmptySelectionDown != null) { EmptySelectionDown(e); Changed?.Invoke(); return; }
         }
         else if (CurrentTool == Tool.Text)
         {
@@ -148,7 +164,7 @@ public sealed class EditorSurface : FrameworkElement
         }
         CaptureMouse(); InvalidateVisual();
     }
-    private Annotation NewAnnotation() => new() { Kind = CurrentTool, Color = Ink, Stroke = Math.Max(1, InkSize / 2), EffectSize = (int)InkSize * 2, Bounds = new Rect(start, new Size(1, 1)), Points = [start] };
+    private Annotation NewAnnotation() => new() { Kind = CurrentTool, Color = Ink, Stroke = Math.Max(1, InkSize / 2), EffectSize = (int)InkSize * 2, Bounds = new Rect(start, new Size(1, 1)), Points = [start], Font = TextFont, FontSize = TextSize, Bold = TextBold, Background = TextBackground };
     private void Move(object sender, MouseEventArgs e)
     {
         if (!IsMouseCaptured) return; var p = Pixel(e);
@@ -178,18 +194,27 @@ public sealed class EditorSurface : FrameworkElement
     }
     private void EditText(Annotation annotation, bool add)
     {
+        if (TextRequested != null) { TextRequested(annotation, add); return; }
         var dialog = new TextDialog(annotation) { Owner = Window.GetWindow(this) };
         if (dialog.ShowDialog() != true) return;
-        document.Checkpoint(); annotation.Text = dialog.Value; annotation.FontSize = dialog.FontSizeValue; annotation.Font = dialog.FontName; annotation.Bold = dialog.IsBold; annotation.Background = dialog.HasBackground;
-        var formatted = new System.Windows.Media.FormattedText(annotation.Text, System.Globalization.CultureInfo.CurrentCulture, FlowDirection.LeftToRight, new Typeface(new FontFamily(annotation.Font), FontStyles.Normal, annotation.Bold ? FontWeights.Bold : FontWeights.Normal, FontStretches.Normal), annotation.FontSize, Brushes.Black, 1);
-        annotation.Bounds = new Rect(annotation.Bounds.Location, new Size(Math.Max(1, formatted.Width), formatted.Height));
-        if (add) document.Annotations.Add(annotation); selected = annotation; Changed?.Invoke();
+        var draft = annotation.Clone(); draft.Text = dialog.Value; draft.FontSize = dialog.FontSizeValue; draft.Font = dialog.FontName; draft.Bold = dialog.IsBold; draft.Background = dialog.HasBackground;
+        ApplyText(annotation, draft, add);
+    }
+    public void ApplyText(Annotation annotation, Annotation draft, bool add)
+    {
+        if (add && string.IsNullOrWhiteSpace(draft.Text)) return;
+        document.Checkpoint(); annotation.Text = draft.Text; annotation.FontSize = draft.FontSize; annotation.Font = draft.Font; annotation.Color = draft.Color; annotation.Bold = draft.Bold; annotation.Background = draft.Background;
+        var formatted = new FormattedText(annotation.Text, System.Globalization.CultureInfo.CurrentCulture, FlowDirection.LeftToRight, new Typeface(new FontFamily(annotation.Font), FontStyles.Normal, annotation.Bold ? FontWeights.Bold : FontWeights.Normal, FontStretches.Normal), annotation.FontSize, Brushes.Black, 1);
+        annotation.Bounds = new Rect(annotation.Bounds.Location, new Size(Math.Max(1, formatted.WidthIncludingTrailingWhitespace), Math.Max(1, formatted.Height)));
+        if (add) document.Annotations.Add(annotation);
+        else if (string.IsNullOrWhiteSpace(annotation.Text)) document.Annotations.Remove(annotation);
+        selected = annotation; Changed?.Invoke(); InvalidateVisual();
     }
     protected override void OnRender(DrawingContext dc)
     {
         dc.DrawRectangle(Brushes.Transparent, null, new Rect(0, 0, ActualWidth, ActualHeight));
         dc.PushTransform(new ScaleTransform(Zoom, Zoom)); dc.PushTransform(new TranslateTransform(-document.Crop.X, -document.Crop.Y));
-        document.Draw(dc, Visible);
+        if (DrawBaseImage) document.Draw(dc, Visible); else document.DrawAnnotations(dc, Visible, HiddenAnnotation);
         if (selected != null && document.Annotations.Contains(selected))
         {
             var pen = new System.Windows.Media.Pen(Ui.Accent, 1 / Zoom) { DashStyle = DashStyles.Dash }; dc.DrawRectangle(null, pen, selected.Bounds);

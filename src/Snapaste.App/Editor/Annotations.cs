@@ -109,7 +109,13 @@ public sealed class EditDocument
     public void Draw(DrawingContext dc, Rect visible)
     {
         dc.PushClip(new RectangleGeometry(Crop)); Image.Draw(dc, visible);
-        foreach (var a in Annotations) { var b = a.Bounds; b.Inflate(Math.Max(40, a.Stroke * 5), Math.Max(40, a.FontSize * 3)); if (b.IntersectsWith(visible)) a.Draw(dc, Image); }
+        DrawAnnotations(dc, visible);
+        dc.Pop();
+    }
+    public void DrawAnnotations(DrawingContext dc, Rect visible, Annotation? hidden = null)
+    {
+        dc.PushClip(new RectangleGeometry(Crop));
+        foreach (var a in Annotations) { if (a == hidden) continue; var b = a.Bounds; b.Inflate(Math.Max(40, a.Stroke * 5), Math.Max(40, a.FontSize * 3)); if (b.IntersectsWith(visible)) a.Draw(dc, Image); }
         dc.Pop();
     }
     public BitmapSource Raster(Rect rect, double scale = 1)
