@@ -2,7 +2,11 @@
 
 独立实现的 Windows 本地截图工具，包含区域截图、对象标注、悬浮贴图、历史记录与通用纵向滚动拼接。代码不使用 Snipaste 的程序、源码、图标或资源。
 
-**当前为 0.3.0 开发预览版，尚未达到完整替代 Snipaste 的日常稳定性验收。** 已实现的链路可以运行，但浏览器五次连续滚动、多显示器混合 DPI 等验收尚未完成；详见 [VALIDATION.md](VALIDATION.md)。
+**当前为 0.3.1 开发预览版，尚未达到完整替代 Snipaste 的日常稳定性验收。** 原生 WPF 页面五次滚动与实际桌面捕获已验证；浏览器、第三方聊天/文档软件、中文 IME 和混合 DPI 的完整交互验收仍待完成。详见 [VALIDATION.md](VALIDATION.md)。
+
+## 0.3.1 验收修复
+
+新增 Windows 锁屏/断开会话检查，避免捕获成功却保存纯黑画面；滚动途中桌面不可用会暂停。完成/取消会话不会被后续操作改变终态，首帧取消不会回写结果。撤销同步会话文件，手动拼接同步匹配元数据。GitHub Actions 在 Windows 上编译并生成便携包。
 
 ## 0.3 原位截图标注
 
@@ -20,7 +24,7 @@
 ## 运行
 
 - 推荐 Windows 11 x64；目标兼容 Windows 10 2004 / build 19041 以上，尚未在 Windows 10 实机验证。
-- 便携包：解压 `artifacts/Snapaste-0.3.0-win-x64.zip`，运行其中 `Snapaste.exe`。自带 .NET 10 运行时，无需安装 SDK。
+- [GitHub 预览版下载](https://github.com/Rinyanami/Snapaste/releases)：或解压本地 `artifacts/Snapaste-0.3.1-win-x64.zip`，运行其中 `Snapaste.exe`。自带 .NET 10 运行时，无需安装 SDK。
 - 普通 Release：`src/Snapaste.App/bin/Release/net10.0-windows/Snapaste.exe`，需要 .NET 10 Windows Desktop Runtime。
 - 默认只显示系统托盘图标。双击托盘截图；右键打开设置、历史、滚动截图或退出。再次启动会打开现有实例的设置。
 - 无账号、服务器、网络请求、遥测或 AI。所有图像处理在本机完成。

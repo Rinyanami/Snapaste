@@ -37,6 +37,8 @@ public static class Strings
         ["ElementMode"] = "控件", ["WindowMode"] = "窗口", ["FreeMode"] = "自由",
         ["ScrollMinRegion"] = "滚动选区至少需要 80 × 100 像素。",
         ["ScrollFreshCapture"] = "滚动截图需要重新捕获页面，当前普通截图的标注不会带入。开始新的滚动截图吗？",
+        ["DesktopLocked"] = "桌面已锁定，无法捕获画面。请解锁 Windows 后重试。",
+        ["DesktopDisconnected"] = "桌面会话已断开，无法捕获画面。请恢复桌面连接后重试。",
     };
     public static string T(string key) => Zh.GetValueOrDefault(key, key);
 }

@@ -10,6 +10,7 @@ public sealed class DesktopCapture : ICaptureProvider
 {
     public BitmapSource Capture(Rect rect, bool cursor = false)
     {
+        DesktopSession.EnsureAvailable();
         if (rect.Width < 1 || rect.Height < 1 || rect.Width * rect.Height > 150_000_000) throw new ArgumentException("截图区域无效或超出内存保护限制。");
         using var bitmap = new Bitmap((int)rect.Width, (int)rect.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(bitmap))
@@ -32,6 +33,7 @@ public sealed class DesktopCapture : ICaptureProvider
                 }
             }
         }
+        DesktopSession.EnsureAvailable();
         var data = bitmap.LockBits(new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height), ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         try { var source = BitmapSource.Create(bitmap.Width, bitmap.Height, 96, 96, PixelFormats.Bgr32, null, data.Scan0, data.Stride * bitmap.Height, data.Stride); source.Freeze(); return source; }
         finally { bitmap.UnlockBits(data); }

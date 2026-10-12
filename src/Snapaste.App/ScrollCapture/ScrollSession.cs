@@ -10,6 +10,7 @@ public sealed class ScrollSession : IDisposable
     private readonly ICaptureProvider capture;
     private readonly Settings settings;
     private readonly CancellationTokenSource cancel = new();
+    private readonly CancellationToken cancellation;
     private readonly string folder = Path.Combine(Paths.Sessions, Guid.NewGuid().ToString("N"));
     private readonly nint target;
     private readonly Rect targetBounds;
@@ -22,6 +23,8 @@ public sealed class ScrollSession : IDisposable
     private bool changed;
     private int noMotion, epoch;
     private double wheelUnits = 3;
+    private bool disposed;
+    private bool Terminal => State is ScrollState.Completed or ScrollState.Cancelled;
     public ScrollState State { get; private set; } = ScrollState.Idle;
     public Rect Region { get; }
     public nint ControlHandle { get; set; }
@@ -37,24 +40,31 @@ public sealed class ScrollSession : IDisposable
     public event Action<ImageDocument>? Finished;
     public ScrollSession(Rect region, nint target, Settings settings, ICaptureProvider capture)
     {
-        Region = region; this.target = target; targetBounds = target == 0 ? Rect.Empty : Native.Bounds(target); desktopBounds = Native.Desktop; this.settings = settings; this.capture = capture;
+        Region = region; this.target = target; targetBounds = target == 0 ? Rect.Empty : Native.Bounds(target); desktopBounds = Native.Desktop; this.settings = settings; this.capture = capture; cancellation = cancel.Token;
     }
     private void SetState(ScrollState state, string message) { State = state; Updated?.Invoke(message); }
     public async Task Start()
     {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (State != ScrollState.Idle) throw new InvalidOperationException("滚动会话不能重复启动。");
         Directory.CreateDirectory(folder); SetState(ScrollState.Ready, "正在捕获第一帧");
         try
         {
-            await Task.Delay(350, cancel.Token); var first = capture.Capture(Region); reference = previous = await Task.Run(() => new FrameSample(first), cancel.Token); Store(first, reference, null, false);
+            await Task.Delay(350, cancellation); var first = capture.Capture(Region); reference = previous = await Task.Run(() => new FrameSample(first), cancellation);
+            if (cancellation.IsCancellationRequested || Terminal) return;
+            Store(first, reference, null, false);
             SetState(ScrollState.WaitingForScroll, "滚动页面继续截图");
             if (settings.AutoScrollDefault) SetAutomatic(true);
-            while (!cancel.IsCancellationRequested)
+            while (!cancellation.IsCancellationRequested)
             {
-                await Task.Delay(150, cancel.Token);
+                await Task.Delay(150, cancellation);
                 if (State is ScrollState.Paused or ScrollState.Failed) continue;
                 if (!ValidateTarget()) { Pause("目标窗口被遮挡、最小化或位置/显示器已改变。请恢复原画面后继续，或完成当前截图。"); continue; }
                 int generation = epoch;
-                var bitmap = capture.Capture(Region); var sample = await Task.Run(() => new FrameSample(bitmap), cancel.Token);
+                BitmapSource bitmap;
+                try { bitmap = capture.Capture(Region); }
+                catch (DesktopUnavailableException e) { Pause(e.Message); continue; }
+                var sample = await Task.Run(() => new FrameSample(bitmap), cancellation);
                 if (generation != epoch || State == ScrollState.Paused) continue;
                 var now = DateTime.UtcNow; double motion = sample.Difference(previous!); previous = sample;
                 if (motion > .004)
@@ -69,7 +79,7 @@ public sealed class ScrollSession : IDisposable
                     else
                     {
                         SetState(ScrollState.Matching, "正在分析重叠区域");
-                        var match = await Task.Run(() => ScrollMatcher.Match(reference!, sample, settings.MatchSensitivity, cancel.Token, TopOverride >= 0 ? TopOverride : frames.Count > 1 ? FixedTop : -1, BottomOverride >= 0 ? BottomOverride : frames.Count > 1 ? FixedBottom : -1), cancel.Token);
+                        var match = await Task.Run(() => ScrollMatcher.Match(reference!, sample, settings.MatchSensitivity, cancellation, TopOverride >= 0 ? TopOverride : frames.Count > 1 ? FixedTop : -1, BottomOverride >= 0 ? BottomOverride : frames.Count > 1 ? FixedBottom : -1), cancellation);
                         if (generation != epoch || State == ScrollState.Paused) continue;
                         LastMatch = match;
                         if (match.Confidence == Confidence.Low)
@@ -91,7 +101,7 @@ public sealed class ScrollSession : IDisposable
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception e) { Log.Error("Scroll session", e); Automatic = false; SetState(ScrollState.Failed, "滚动截图已停止：" + e.Message); }
+        catch (Exception e) { Log.Error("Scroll session", e); if (!Terminal) { Automatic = false; SetState(ScrollState.Failed, "滚动截图已停止：" + e.Message); } }
     }
     private bool ValidateTarget()
     {
@@ -106,21 +116,23 @@ public sealed class ScrollSession : IDisposable
     }
     private void Accept(BitmapSource bitmap, FrameSample sample, MatchMetadata match, bool manual)
     {
+        LastMatch = match;
         SetState(ScrollState.Stitching, "正在拼接"); FixedTop = match.FixedTop; FixedBottom = match.FixedBottom;
         Store(bitmap, sample, match, manual); reference = previous = sample; pending = null; pendingSample = null; noMotion = 0;
         double ideal = (Region.Height - FixedTop - FixedBottom) * .42;
         wheelUnits = Math.Clamp(wheelUnits * ideal / Math.Max(1, match.Offset), 1, 10);
         nextWheel = DateTime.UtcNow.AddMilliseconds(settings.AutoScrollDelay); lastChange = DateTime.UtcNow;
         SetState(ScrollState.WaitingForScroll, $"已拼接 {frames.Count} 帧 · +{match.Offset}px · {match.Confidence} {match.Score:P0}");
-        if (frames.Count >= settings.MaxScrollFrames) Pause("已达到连续截图数量上限，请完成保存。");
+        if (!Terminal && frames.Count >= settings.MaxScrollFrames) Pause("已达到连续截图数量上限，请完成保存。");
     }
     private void Store(BitmapSource bitmap, FrameSample sample, MatchMetadata? match, bool manual)
     {
         var path = Path.Combine(folder, $"frame-{frames.Count:D5}.png"); ImageDocument.SaveBitmap(bitmap, path);
         var frame = new ScrollFrame { BitmapPath = path, CaptureRect = Region, FrameIndex = frames.Count, PerceptualHash = sample.Hash, MatchMetadata = match };
         frames.Add(frame); frame.StitchMetadata = new(match?.Offset ?? bitmap.PixelHeight, BuildImage().Height, manual);
-        AtomicFile.Write(Path.Combine(folder, "session.json"), JsonSerializer.Serialize(new { Region, FixedTop, FixedBottom, Frames = frames.Select(f => new { f.BitmapPath, f.Timestamp, f.CaptureRect, f.FrameIndex, f.PerceptualHash, f.MatchMetadata, f.StitchMetadata }) }, Settings.Json));
+        SaveManifest();
     }
+    private void SaveManifest() => AtomicFile.Write(Path.Combine(folder, "session.json"), JsonSerializer.Serialize(new { Region, State, FixedTop, FixedBottom, Frames = frames.Select(f => new { f.BitmapPath, f.Timestamp, f.CaptureRect, f.FrameIndex, f.PerceptualHash, f.MatchMetadata, f.StitchMetadata }) }, Settings.Json));
     public ImageDocument BuildImage()
     {
         if (frames.Count == 0) throw new InvalidOperationException("尚未获取第一帧。");
@@ -134,22 +146,24 @@ public sealed class ScrollSession : IDisposable
         if (FixedBottom > 0) segments.Add(new(frames[^1].BitmapPath, h - FixedBottom, FixedBottom, end));
         return new ImageDocument((int)Region.Width, segments);
     }
-    public void Pause(string message = "已暂停") { epoch++; Automatic = false; SetState(ScrollState.Paused, message); }
+    public void Pause(string message = "已暂停") { if (Terminal) return; epoch++; Automatic = false; SetState(ScrollState.Paused, message); }
     public void Resume()
     {
+        if (Terminal) return;
         if (pending != null) { Updated?.Invoke("请先手动修正或忽略待确认的帧。"); return; }
         epoch++; changed = false; stableSince = DateTime.UtcNow; SetState(ScrollState.WaitingForScroll, "继续滚动页面");
     }
     public void SetAutomatic(bool enabled)
     {
+        if (Terminal) return;
         if (!enabled) { Pause(); return; }
         if (pending != null) { Updated?.Invoke("请先处理待确认帧。"); return; }
         Resume(); Automatic = true; noMotion = 0; nextWheel = DateTime.UtcNow.AddSeconds(2.5); Updated?.Invoke("2.5 秒后自动滚动，请将鼠标移到选区内。移出选区会暂停。");
     }
-    public void Ignore() { epoch++; pending = null; pendingSample = null; Resume(); }
+    public void Ignore() { if (Terminal) return; epoch++; pending = null; pendingSample = null; Resume(); }
     public void Manual(int offset)
     {
-        if (pending == null || pendingSample == null) return;
+        if (Terminal || pending == null || pendingSample == null) return;
         int top = TopOverride >= 0 ? TopOverride : LastMatch?.FixedTop ?? FixedTop, bottom = BottomOverride >= 0 ? BottomOverride : LastMatch?.FixedBottom ?? FixedBottom;
         offset = Math.Clamp(offset, 1, (int)Region.Height - bottom - Math.Max(1, top));
         var match = new MatchMetadata(offset, 1, 0, 1, 1, Confidence.High, top, bottom);
@@ -157,11 +171,13 @@ public sealed class ScrollSession : IDisposable
     }
     public void Undo()
     {
-        if (frames.Count < 2) return;
+        if (Terminal || frames.Count < 2) return;
         Pause("已撤销上一段。将页面滚回上一帧附近再继续。"); frames.RemoveAt(frames.Count - 1);
-        reference = previous = new FrameSample(frames[^1].Bitmap); pending = null; pendingSample = null; LastMatch = frames[^1].MatchMetadata; Updated?.Invoke("已撤销上一段；请将页面滚回对应位置后继续。");
+        reference = previous = new FrameSample(frames[^1].Bitmap); pending = null; pendingSample = null; LastMatch = frames[^1].MatchMetadata;
+        FixedTop = TopOverride >= 0 ? TopOverride : LastMatch?.FixedTop ?? 0; FixedBottom = BottomOverride >= 0 ? BottomOverride : LastMatch?.FixedBottom ?? 0;
+        SaveManifest(); Updated?.Invoke("已撤销上一段；请将页面滚回对应位置后继续。");
     }
-    public void Complete() { if (frames.Count == 0) return; epoch++; Automatic = false; cancel.Cancel(); SetState(ScrollState.Completed, "完成"); Finished?.Invoke(BuildImage()); }
-    public void Cancel() { epoch++; Automatic = false; cancel.Cancel(); SetState(ScrollState.Cancelled, "已取消"); }
-    public void Dispose() { Cancel(); }
+    public void Complete() { if (Terminal || frames.Count == 0) return; epoch++; Automatic = false; cancel.Cancel(); SetState(ScrollState.Completed, "完成"); SaveManifest(); Finished?.Invoke(BuildImage()); }
+    public void Cancel() { if (Terminal) return; epoch++; Automatic = false; cancel.Cancel(); SetState(ScrollState.Cancelled, "已取消"); }
+    public void Dispose() { if (disposed) return; Cancel(); disposed = true; cancel.Dispose(); }
 }
