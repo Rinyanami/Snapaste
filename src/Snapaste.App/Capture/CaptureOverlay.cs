@@ -19,6 +19,8 @@ public sealed class CaptureOverlay : Window
     private readonly WrapPanel toolbarItems = new() { MaxWidth = 900 }, options = new();
     private readonly StackPanel palette = new() { Orientation = Orientation.Horizontal }, sizeOptions = new() { Orientation = Orientation.Horizontal };
     private readonly WrapPanel textOptions = new();
+    private readonly Slider sizeSlider = new() { Minimum = 2, Maximum = 40, Value = 5, Width = 90, VerticalAlignment = VerticalAlignment.Center };
+    private readonly SelectionActions transforms;
     private readonly TextBlock sizeLabel = Ui.Label("", 11, true), hint = Ui.Label("", 11, true);
     private readonly ComboBox font = new() { Width = 155, IsEditable = true, MaxDropDownHeight = 220 }, fontSize = new() { Width = 60, IsEditable = true };
     private readonly CheckBox bold = new() { Content = Strings.T("Bold"), Margin = new Thickness(6) }, textBackground = new() { Content = Strings.T("Background"), Margin = new Thickness(6) };
@@ -67,7 +69,7 @@ public sealed class CaptureOverlay : Window
             var value = action; var button = Ui.Tool(action, Strings.T(action), () => { if (value == "Cancel") Close(); else Finish(value); }); Compact(button); toolbarItems.Children.Add(button);
         }
         toolbarItems.Children.Add(Ui.Action("Copy", Strings.T("Copy"), () => Finish("Copy"), true, Strings.T("CopyFinishHint")));
-        BuildOptions();
+        transforms = new SelectionActions(annotations, CommitText); BuildOptions();
         annotations.Changed += Refresh; annotations.TextRequested += BeginText;
         annotations.EmptySelectionDown += e => { if (e.ClickCount == 2) Finish("Copy"); else BeginDrag(e); e.Handled = true; };
         surface.MouseLeftButtonDown += (_, e) => BeginDrag(e);
@@ -76,8 +78,11 @@ public sealed class CaptureOverlay : Window
         PreviewMouseLeftButtonDown += (_, e) =>
         {
             if (Within(e.OriginalSource, toolbar) || Within(e.OriginalSource, textInput)) return;
-            CommitText();
-            if (!selected.IsEmpty && annotations.CurrentTool == Tool.Select && Hit(Physical(e)) >= 0) { BeginDrag(e); e.Handled = true; }
+            if (textInput != null)
+            {
+                CommitText(); annotations.ClearSelection(); annotations.Focus(); e.Handled = true; return;
+            }
+            if (!selected.IsEmpty && annotations.CurrentTool == Tool.Select && Hit(Physical(e)) >= 0 && !annotations.HitSelection(Physical(e) - new Vector(screen.X, screen.Y))) { BeginDrag(e); e.Handled = true; }
         };
         PreviewMouseMove += (_, e) =>
         {
@@ -109,16 +114,16 @@ public sealed class CaptureOverlay : Window
     }
     private void BuildOptions()
     {
-        options.Margin = new Thickness(5, 3, 5, 2); options.Children.Add(palette); options.Children.Add(sizeOptions); options.Children.Add(textOptions); options.Children.Add(hint);
+        options.Margin = new Thickness(5, 3, 5, 2); options.Children.Add(palette); options.Children.Add(sizeOptions); options.Children.Add(textOptions); options.Children.Add(transforms); options.Children.Add(hint);
         foreach (var value in new[] { "#E95D75", "#EFA25E", "#EAC858", "#50A78B", "#5D93D8", "#9571CA", "#FFFFFF", "#302C38" })
         {
-            var color = (Color)ColorConverter.ConvertFromString(value); var b = Ui.Button(value, () => { annotations.Ink = color; ApplyTextOptions(); Refresh(); });
+            var color = (Color)ColorConverter.ConvertFromString(value); var b = Ui.Button(value, () => { if (textInput != null) { annotations.Ink = color; ApplyTextOptions(); } else annotations.SetColor(color); Refresh(); });
             b.Content = new System.Windows.Shapes.Ellipse { Width = 13, Height = 13, Fill = new SolidColorBrush(color), Stroke = Ui.Brush("BorderBrush"), StrokeThickness = 1 };
             b.Width = b.Height = b.MinHeight = 24; b.Padding = new Thickness(4); b.Margin = new Thickness(1); colors.Add((color, b)); palette.Children.Add(b);
         }
         sizeLabel.Margin = new Thickness(10, 0, 5, 0); sizeLabel.VerticalAlignment = VerticalAlignment.Center; sizeOptions.Children.Add(sizeLabel);
-        var slider = new Slider { Minimum = 2, Maximum = 40, Value = 5, Width = 90, VerticalAlignment = VerticalAlignment.Center };
-        slider.ValueChanged += (_, _) => annotations.InkSize = slider.Value; sizeOptions.Children.Add(slider);
+        sizeSlider.ValueChanged += (_, _) => { if (!updatingTextOptions) annotations.SetSize(sizeSlider.Value); }; sizeOptions.Children.Add(sizeSlider);
+        sizeSlider.PreviewMouseLeftButtonDown += (_, _) => annotations.BeginStyleEdit(); sizeSlider.PreviewMouseLeftButtonUp += (_, _) => annotations.EndStyleEdit(); sizeSlider.LostMouseCapture += (_, _) => annotations.EndStyleEdit();
         font.ItemsSource = Fonts.SystemFontFamilies.Select(f => f.Source).Order().ToList(); font.Text = annotations.TextFont;
         fontSize.ItemsSource = new[] { "12", "16", "20", "24", "32", "48", "64", "96" }; fontSize.Text = "24";
         foreach (var control in new FrameworkElement[] { font, fontSize, bold, textBackground }) textOptions.Children.Add(control);
@@ -225,23 +230,32 @@ public sealed class CaptureOverlay : Window
     private void SelectTool(Tool tool)
     {
         CommitText(); annotations.CurrentTool = tool; annotations.Cursor = tool == Tool.Select ? Cursors.Arrow : tool == Tool.Text ? Cursors.IBeam : Cursors.Cross;
-        annotations.ClearSelection(); annotations.Focus(); Refresh();
+        if (tool is Tool.Crop or Tool.Color) annotations.ClearSelection(); annotations.Focus(); Refresh();
     }
     private void UpdateOptions()
     {
-        var tool = annotations.CurrentTool;
-        foreach (var pair in tools) pair.Value.Tag = pair.Key == tool ? "Selected" : null;
-        foreach (var color in colors) color.Button.BorderBrush = color.Color == annotations.Ink ? Ui.Accent : Brushes.Transparent;
+        var tool = annotations.EffectiveTool;
+        foreach (var pair in tools) pair.Value.Tag = pair.Key == annotations.CurrentTool ? "Selected" : null;
+        foreach (var color in colors) color.Button.BorderBrush = color.Color == (textInput != null ? annotations.Ink : annotations.DisplayColor) ? Ui.Accent : Brushes.Transparent;
+        updatingTextOptions = true;
+        sizeSlider.Value = Math.Clamp(annotations.DisplaySize, sizeSlider.Minimum, sizeSlider.Maximum);
+        if (textInput == null)
+        {
+            var a = annotations.Selection;
+            font.Text = a?.Kind == Tool.Text ? a.Font : annotations.TextFont; fontSize.Text = (a?.Kind == Tool.Text ? a.FontSize : annotations.TextSize).ToString("0.#", CultureInfo.InvariantCulture);
+            bold.IsChecked = a?.Kind == Tool.Text ? a.Bold : annotations.TextBold; textBackground.IsChecked = a?.Kind == Tool.Text ? a.Background : annotations.TextBackground;
+        }
+        updatingTextOptions = false; transforms.Refresh(textInput == null);
         undo.IsEnabled = Document.CanUndo || textInput != null; redo.IsEnabled = Document.CanRedo; delete.IsEnabled = annotations.HasSelection;
         palette.Visibility = textInput == null && (tool is Tool.Select or Tool.Crop or Tool.Mosaic or Tool.Blur) ? Visibility.Collapsed : Visibility.Visible;
         sizeOptions.Visibility = tool is Tool.Select or Tool.Crop or Tool.Text or Tool.Color ? Visibility.Collapsed : Visibility.Visible;
         textOptions.Visibility = tool == Tool.Text || textInput != null ? Visibility.Visible : Visibility.Collapsed;
         sizeLabel.Text = Strings.T(tool == Tool.Mosaic ? "BlockSize" : tool == Tool.Blur ? "BlurSize" : "StrokeSize");
-        hint.Text = Strings.T(textInput != null ? "InlineTextHint" : tool == Tool.Select ? "OverlaySelectHint" : tool == Tool.Crop ? "OverlayCropHint" : tool == Tool.Color ? "OverlayColorHint" : tool == Tool.Text ? "OverlayTextHint" : "OverlayDrawHint");
+        hint.Text = Strings.T(textInput != null ? "InlineTextHint" : annotations.HasSelection ? "ObjectSelectedHint" : tool == Tool.Select ? "OverlaySelectHint" : tool == Tool.Crop ? "OverlayCropHint" : tool == Tool.Color ? "OverlayColorHint" : tool == Tool.Text ? "OverlayTextHint" : "OverlayDrawHint");
     }
     private void History(bool forward)
     {
-        CommitText(); if (forward) Document.Redo(); else Document.Undo(); annotations.ClearSelection(); Refresh();
+        CommitText(); if (forward) Document.Redo(); else Document.Undo(); Refresh();
     }
     private static Tool? KeyTool(Key key) => key switch { System.Windows.Input.Key.V => Tool.Select, System.Windows.Input.Key.R => Tool.Rectangle, System.Windows.Input.Key.E => Tool.Ellipse, System.Windows.Input.Key.L => Tool.Line, System.Windows.Input.Key.A => Tool.Arrow, System.Windows.Input.Key.P => Tool.Pen, System.Windows.Input.Key.H => Tool.Highlighter, System.Windows.Input.Key.T => Tool.Text, System.Windows.Input.Key.M => Tool.Mosaic, System.Windows.Input.Key.B => Tool.Blur, System.Windows.Input.Key.X => Tool.Crop, System.Windows.Input.Key.I => Tool.Color, _ => null };
     private void Key(object sender, KeyEventArgs e)
@@ -288,7 +302,7 @@ public sealed class CaptureOverlay : Window
         updatingTextOptions = true;
         font.Text = annotation.Font; fontSize.Text = annotation.FontSize.ToString(CultureInfo.InvariantCulture); bold.IsChecked = annotation.Bold; textBackground.IsChecked = annotation.Background; annotations.Ink = annotation.Color;
         updatingTextOptions = false;
-        textInput = new TextBox { Text = annotation.Text, AcceptsReturn = true, TextWrapping = TextWrapping.NoWrap, Padding = new Thickness(2), BorderThickness = new Thickness(1), MinWidth = 70, MinHeight = 28 };
+        textInput = new TextBox { Text = annotation.Text, AcceptsReturn = true, TextWrapping = annotation.TextWidth > 0 ? TextWrapping.Wrap : TextWrapping.NoWrap, Padding = new Thickness(0), BorderThickness = new Thickness(1), MinWidth = 24, MinHeight = 24 };
         textInput.SetResourceReference(Control.BorderBrushProperty, "AccentBrush");
         InputMethod.SetIsInputMethodEnabled(textInput, true);
         root.Children.Add(textInput); Panel.SetZIndex(textInput, 2);
@@ -298,15 +312,23 @@ public sealed class CaptureOverlay : Window
     {
         if (updatingTextOptions) return;
         annotations.TextFont = string.IsNullOrWhiteSpace(font.Text) ? "Microsoft YaHei UI" : font.Text;
-        if (double.TryParse(fontSize.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var size) && double.IsFinite(size)) annotations.TextSize = Math.Clamp(size, 8, 300);
+        if (!double.TryParse(fontSize.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var size) || !double.IsFinite(size) || size < 8 || size > 300) return;
+        annotations.TextSize = size;
         annotations.TextBold = bold.IsChecked == true; annotations.TextBackground = textBackground.IsChecked == true;
-        if (textInput == null || textDraft == null) return;
+        if (textInput == null || textDraft == null) { annotations.SetTextStyle(annotations.TextFont, annotations.TextSize, annotations.TextBold, annotations.TextBackground); return; }
         textDraft.Font = annotations.TextFont; textDraft.FontSize = annotations.TextSize; textDraft.Bold = annotations.TextBold; textDraft.Background = annotations.TextBackground; textDraft.Color = annotations.Ink;
         textInput.FontFamily = new FontFamily(textDraft.Font); textInput.FontSize = textDraft.FontSize * annotations.Zoom; textInput.FontWeight = textDraft.Bold ? FontWeights.Bold : FontWeights.Normal;
         textInput.Foreground = new SolidColorBrush(textDraft.Color); textInput.Background = textDraft.Background ? new SolidColorBrush(Color.FromArgb(230, 255, 255, 255)) : Brushes.Transparent;
         var origin = Local(new Point(textDraft.Bounds.X + screen.X, textDraft.Bounds.Y + screen.Y));
-        Canvas.SetLeft(textInput, origin.X - 3); Canvas.SetTop(textInput, origin.Y - 3);
-        textInput.MaxWidth = Math.Max(70, Local(selected).Right - origin.X); textInput.MaxHeight = Math.Max(28, Local(selected).Bottom - origin.Y);
+        Canvas.SetLeft(textInput, origin.X - 1); Canvas.SetTop(textInput, origin.Y - 1);
+        double available = Math.Max(24, Local(selected).Right - origin.X);
+        textInput.Width = textDraft.TextWidth > 0 ? Math.Max(24, textDraft.TextWidth * annotations.Zoom + 2) : double.NaN;
+        textInput.MaxWidth = textDraft.TextWidth > 0 ? double.PositiveInfinity : available;
+        // Match the annotation's transform while keeping native WPF text services/IME.
+        var matrix = textDraft.Transform; var local = Matrix.Identity;
+        local.Translate(textDraft.Bounds.X, textDraft.Bounds.Y); local.Append(matrix); local.Translate(-textDraft.Bounds.X, -textDraft.Bounds.Y);
+        local.OffsetX *= annotations.Zoom; local.OffsetY *= annotations.Zoom;
+        textInput.RenderTransform = new MatrixTransform(local);
     }
     private void CommitText()
     {

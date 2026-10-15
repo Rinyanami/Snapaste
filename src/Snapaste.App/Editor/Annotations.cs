@@ -16,11 +16,66 @@ public sealed class Annotation
     public double FontSize { get; set; } = 24;
     public bool Bold { get; set; }
     public bool Background { get; set; }
+    public double TextWidth { get; set; }
+    public double Rotation { get; set; }
+    public bool FlipX { get; set; }
+    public bool FlipY { get; set; }
     public int EffectSize { get; set; } = 12;
     private BitmapSource? effect;
     private Rect effectBounds;
     private int effectSize;
-    public Annotation Clone() => new() { Id = Id, Kind = Kind, Bounds = Bounds, Points = [.. Points], Color = Color, Stroke = Stroke, Text = Text, Font = Font, FontSize = FontSize, Bold = Bold, Background = Background, EffectSize = EffectSize };
+    public Annotation Clone() => new() { Id = Id, Kind = Kind, Bounds = Bounds, Points = [.. Points], Color = Color, Stroke = Stroke, Text = Text, Font = Font, FontSize = FontSize, Bold = Bold, Background = Background, TextWidth = TextWidth, Rotation = Rotation, FlipX = FlipX, FlipY = FlipY, EffectSize = EffectSize };
+    public Matrix Transform
+    {
+        get
+        {
+            var center = new Point(Bounds.X + Bounds.Width / 2, Bounds.Y + Bounds.Height / 2);
+            var matrix = Matrix.Identity;
+            matrix.ScaleAt(FlipX ? -1 : 1, FlipY ? -1 : 1, center.X, center.Y);
+            matrix.RotateAt(Rotation, center.X, center.Y); return matrix;
+        }
+    }
+    public Point ToWorld(Point point) => Transform.Transform(point);
+    public Point ToLocal(Point point) { var inverse = Transform; inverse.Invert(); return inverse.Transform(point); }
+    public Rect VisualBounds => new MatrixTransform(Transform).TransformBounds(Bounds);
+    public FormattedText FormatText(Brush brush)
+    {
+        var text = new FormattedText(Text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, new Typeface(new FontFamily(Font), FontStyles.Normal, Bold ? FontWeights.Bold : FontWeights.Normal, FontStretches.Normal), FontSize, brush, 1);
+        if (TextWidth > 0) text.MaxTextWidth = Math.Clamp(TextWidth, 1, 30000);
+        return text;
+    }
+    public void MeasureText()
+    {
+        var text = FormatText(Brushes.Black);
+        Bounds = new Rect(Bounds.Location, new Size(Math.Max(1, TextWidth > 0 ? TextWidth : text.WidthIncludingTrailingWhitespace), Math.Max(1, text.Height)));
+    }
+    public bool HitTest(Point point, double tolerance)
+    {
+        point = ToLocal(point);
+        var bounds = Bounds; bounds.Inflate(tolerance, tolerance);
+        if (!bounds.Contains(point)) return false;
+        if (Kind == Tool.Rectangle)
+        {
+            var interior = Bounds; interior.Inflate(-Math.Min(Bounds.Width / 2, tolerance + Stroke / 2), -Math.Min(Bounds.Height / 2, tolerance + Stroke / 2));
+            return !interior.Contains(point);
+        }
+        if (Kind == Tool.Ellipse && Bounds.Width > 0 && Bounds.Height > 0)
+        {
+            double x = (point.X - Bounds.X - Bounds.Width / 2) / (Bounds.Width / 2), y = (point.Y - Bounds.Y - Bounds.Height / 2) / (Bounds.Height / 2);
+            return Math.Abs(Math.Sqrt(x * x + y * y) - 1) * Math.Min(Bounds.Width, Bounds.Height) / 2 <= tolerance + Stroke / 2;
+        }
+        if (Kind is Tool.Line or Tool.Arrow or Tool.Pen or Tool.Highlighter)
+        {
+            double distance = tolerance + Stroke * (Kind == Tool.Highlighter ? 2.5 : Kind == Tool.Arrow ? 2 : .5);
+            for (int i = 1; i < Points.Count; i++)
+            {
+                var segment = Points[i] - Points[i - 1]; double t = segment.LengthSquared < .001 ? 0 : Math.Clamp(Vector.Multiply(point - Points[i - 1], segment) / segment.LengthSquared, 0, 1);
+                if ((point - (Points[i - 1] + segment * t)).Length <= distance) return true;
+            }
+            return false;
+        }
+        return true;
+    }
     public void Translate(Vector d) { Bounds = new Rect(Bounds.Location + d, Bounds.Size); for (int i = 0; i < Points.Count; i++) Points[i] += d; }
     public void Resize(Rect next)
     {
@@ -29,6 +84,7 @@ public sealed class Annotation
     }
     public void Draw(DrawingContext dc, ImageDocument image)
     {
+        dc.PushTransform(new MatrixTransform(Transform));
         var brush = new SolidColorBrush(Color); var pen = new System.Windows.Media.Pen(brush, Stroke) { StartLineCap = PenLineCap.Round, EndLineCap = PenLineCap.Round, LineJoin = PenLineJoin.Round };
         switch (Kind)
         {
@@ -50,8 +106,8 @@ public sealed class Annotation
                 if (Kind == Tool.Highlighter) { brush = new SolidColorBrush(Color) { Opacity = .32 }; pen = new(brush, Stroke * 5) { StartLineCap = PenLineCap.Square, EndLineCap = PenLineCap.Square }; }
                 var geometry = new StreamGeometry(); using (var c = geometry.Open()) { c.BeginFigure(Points[0], false, false); c.PolyLineTo(Points.Skip(1).ToList(), true, false); } dc.DrawGeometry(null, pen, geometry); break;
             case Tool.Text:
-                var text = new FormattedText(Text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, new Typeface(new FontFamily(Font), FontStyles.Normal, Bold ? FontWeights.Bold : FontWeights.Normal, FontStretches.Normal), FontSize, brush, 1);
-                if (Background) dc.DrawRectangle(new SolidColorBrush(Colors.White) { Opacity = .9 }, null, new Rect(Bounds.Location, new Size(text.Width + 8, text.Height + 4)));
+                var text = FormatText(brush);
+                if (Background) dc.DrawRectangle(new SolidColorBrush(Colors.White) { Opacity = .9 }, null, Bounds);
                 dc.DrawText(text, Bounds.Location); break;
             case Tool.Mosaic:
             case Tool.Blur:
@@ -62,6 +118,7 @@ public sealed class Annotation
                 }
                 dc.DrawImage(effect, area); break;
         }
+        dc.Pop();
     }
 }
 public static class Effects
@@ -115,7 +172,7 @@ public sealed class EditDocument
     public void DrawAnnotations(DrawingContext dc, Rect visible, Annotation? hidden = null)
     {
         dc.PushClip(new RectangleGeometry(Crop));
-        foreach (var a in Annotations) { if (a == hidden) continue; var b = a.Bounds; b.Inflate(Math.Max(40, a.Stroke * 5), Math.Max(40, a.FontSize * 3)); if (b.IntersectsWith(visible)) a.Draw(dc, Image); }
+        foreach (var a in Annotations) { if (a == hidden) continue; var b = a.VisualBounds; b.Inflate(Math.Max(40, a.Stroke * 5), Math.Max(40, a.FontSize * 3)); if (b.IntersectsWith(visible)) a.Draw(dc, Image); }
         dc.Pop();
     }
     public BitmapSource Raster(Rect rect, double scale = 1)

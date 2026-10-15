@@ -13,6 +13,12 @@ public sealed class EditorWindow : Window
     private readonly StackPanel colorOptions = new() { Orientation = Orientation.Horizontal };
     private readonly StackPanel sizeOptions = new() { Orientation = Orientation.Horizontal };
     private readonly TextBlock sizeLabel = Ui.Label("线宽", 11, true);
+    private readonly Slider size = new() { Minimum = 2, Maximum = 40, Value = 5, Width = 105, VerticalAlignment = VerticalAlignment.Center };
+    private readonly WrapPanel textOptions = new();
+    private readonly ComboBox textFont = new() { Width = 160, IsEditable = true, MaxDropDownHeight = 220 }, textSize = new() { Width = 62, IsEditable = true };
+    private readonly CheckBox bold = new() { Content = Strings.T("Bold"), Margin = new Thickness(6) }, background = new() { Content = Strings.T("Background"), Margin = new Thickness(6) };
+    private readonly SelectionActions transforms;
+    private bool updatingOptions;
     private readonly Button undo, redo, delete;
     private bool exporting;
     public event Action<EditDocument>? PinRequested;
@@ -41,10 +47,16 @@ public sealed class EditorWindow : Window
         var options = new WrapPanel { Margin = new Thickness(18, 7, 18, 10), MinHeight = 28 }; top.Children.Add(options); options.Children.Add(colorOptions);
         foreach (var value in new[] { "#E95D75", "#EFA25E", "#EAC858", "#50A78B", "#5D93D8", "#9571CA", "#FFFFFF", "#302C38" })
         {
-            var color = (Color)ColorConverter.ConvertFromString(value); var b = Ui.Button("颜色 " + value, () => { surface.Ink = color; UpdateStatus(); }); b.Content = new System.Windows.Shapes.Ellipse { Width = 15, Height = 15, Fill = new SolidColorBrush(color), Stroke = Ui.Brush("BorderBrush"), StrokeThickness = 1 }; b.Padding = new Thickness(5); b.MinHeight = 26; b.Width = 26; b.Height = 26; b.Margin = new Thickness(2); colors.Add((color, b)); colorOptions.Children.Add(b);
+            var color = (Color)ColorConverter.ConvertFromString(value); var b = Ui.Button("颜色 " + value, () => surface.SetColor(color)); b.Content = new System.Windows.Shapes.Ellipse { Width = 15, Height = 15, Fill = new SolidColorBrush(color), Stroke = Ui.Brush("BorderBrush"), StrokeThickness = 1 }; b.Padding = new Thickness(5); b.MinHeight = 26; b.Width = 26; b.Height = 26; b.Margin = new Thickness(2); colors.Add((color, b)); colorOptions.Children.Add(b);
         }
         sizeLabel.Margin = new Thickness(14, 0, 6, 0); sizeLabel.VerticalAlignment = VerticalAlignment.Center; sizeOptions.Children.Add(sizeLabel);
-        var size = new Slider { Minimum = 2, Maximum = 40, Value = 5, Width = 105, VerticalAlignment = VerticalAlignment.Center }; size.ValueChanged += (_, _) => surface.InkSize = size.Value; sizeOptions.Children.Add(size); options.Children.Add(sizeOptions);
+        size.ValueChanged += (_, _) => { if (!updatingOptions) surface.SetSize(size.Value); }; sizeOptions.Children.Add(size); options.Children.Add(sizeOptions);
+        size.PreviewMouseLeftButtonDown += (_, _) => surface.BeginStyleEdit(); size.PreviewMouseLeftButtonUp += (_, _) => surface.EndStyleEdit(); size.LostMouseCapture += (_, _) => surface.EndStyleEdit();
+        textFont.ItemsSource = Fonts.SystemFontFamilies.Select(f => f.Source).Order().ToList(); textSize.ItemsSource = new[] { "12", "16", "20", "24", "32", "48", "64", "96" };
+        foreach (var control in new FrameworkElement[] { textFont, textSize, bold, background }) textOptions.Children.Add(control);
+        textFont.AddHandler(TextBox.TextChangedEvent, new TextChangedEventHandler((_, _) => ApplyTextStyle())); textSize.AddHandler(TextBox.TextChangedEvent, new TextChangedEventHandler((_, _) => ApplyTextStyle()));
+        bold.Checked += (_, _) => ApplyTextStyle(); bold.Unchecked += (_, _) => ApplyTextStyle(); background.Checked += (_, _) => ApplyTextStyle(); background.Unchecked += (_, _) => ApplyTextStyle();
+        options.Children.Add(textOptions); transforms = new SelectionActions(surface); options.Children.Add(transforms);
         context.VerticalAlignment = VerticalAlignment.Center; context.Margin = new Thickness(18, 0, 0, 0); options.Children.Add(context);
         var footer = new DockPanel { Margin = new Thickness(18, 7, 18, 7), LastChildFill = false }; DockPanel.SetDock(footer, Dock.Bottom); dock.Children.Add(footer); status.VerticalAlignment = VerticalAlignment.Center; footer.Children.Add(status);
         var zoom = new StackPanel { Orientation = Orientation.Horizontal }; DockPanel.SetDock(zoom, Dock.Right); footer.Children.Add(zoom);
@@ -72,7 +84,7 @@ public sealed class EditorWindow : Window
     }
     private static string Shortcut(Tool tool) => tool switch { Tool.Select => "V", Tool.Rectangle => "R", Tool.Ellipse => "E", Tool.Line => "L", Tool.Arrow => "A", Tool.Pen => "P", Tool.Highlighter => "H", Tool.Text => "T", Tool.Mosaic => "M", Tool.Blur => "B", Tool.Crop => "X", Tool.Color => "I", _ => "" };
     private static Tool? KeyTool(Key key) => key switch { Key.V => Tool.Select, Key.R => Tool.Rectangle, Key.E => Tool.Ellipse, Key.L => Tool.Line, Key.A => Tool.Arrow, Key.P => Tool.Pen, Key.H => Tool.Highlighter, Key.T => Tool.Text, Key.M => Tool.Mosaic, Key.B => Tool.Blur, Key.X => Tool.Crop, Key.I => Tool.Color, _ => null };
-    private void Select(Tool tool) { surface.CurrentTool = tool; surface.Cursor = tool == Tool.Select ? Cursors.Arrow : Cursors.Cross; surface.Focus(); UpdateStatus(); }
+    private void Select(Tool tool) { surface.CurrentTool = tool; if (tool is Tool.Crop or Tool.Color) surface.ClearSelection(); surface.Cursor = tool == Tool.Select ? Cursors.Arrow : Cursors.Cross; surface.Focus(); UpdateStatus(); }
     private async void Copy(bool close)
     {
         if (exporting) return; exporting = true;
@@ -92,139 +104,23 @@ public sealed class EditorWindow : Window
     private void UpdateStatus()
     {
         foreach (var pair in toolButtons) pair.Value.Tag = surface.CurrentTool == pair.Key ? "Selected" : null;
-        foreach (var color in colors) color.Button.BorderBrush = color.Color == surface.Ink ? Ui.Accent : Brushes.Transparent;
+        foreach (var color in colors) color.Button.BorderBrush = color.Color == surface.DisplayColor ? Ui.Accent : Brushes.Transparent;
         undo.IsEnabled = Document.CanUndo; redo.IsEnabled = Document.CanRedo; delete.IsEnabled = surface.HasSelection;
-        var tool = surface.CurrentTool; colorOptions.Visibility = tool is Tool.Select or Tool.Crop or Tool.Mosaic or Tool.Blur ? Visibility.Collapsed : Visibility.Visible; sizeOptions.Visibility = tool is Tool.Select or Tool.Crop or Tool.Text or Tool.Color ? Visibility.Collapsed : Visibility.Visible;
+        var tool = surface.EffectiveTool; colorOptions.Visibility = tool is Tool.Select or Tool.Crop or Tool.Mosaic or Tool.Blur ? Visibility.Collapsed : Visibility.Visible; sizeOptions.Visibility = tool is Tool.Select or Tool.Crop or Tool.Text or Tool.Color ? Visibility.Collapsed : Visibility.Visible;
+        updatingOptions = true; size.Value = Math.Clamp(surface.DisplaySize, 2, 40);
+        var a = surface.Selection; textFont.Text = a?.Kind == Tool.Text ? a.Font : surface.TextFont; textSize.Text = (a?.Kind == Tool.Text ? a.FontSize : surface.TextSize).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture);
+        bold.IsChecked = a?.Kind == Tool.Text ? a.Bold : surface.TextBold; background.IsChecked = a?.Kind == Tool.Text ? a.Background : surface.TextBackground;
+        updatingOptions = false; transforms.Refresh(); textOptions.Visibility = tool == Tool.Text ? Visibility.Visible : Visibility.Collapsed;
         sizeLabel.Text = tool == Tool.Mosaic ? "块大小" : tool == Tool.Blur ? "模糊强度" : "线宽";
-        context.Text = tool switch { Tool.Select => "点击选择 · 拖动移动 · 双击文字修改", Tool.Crop => "拖动保留区域 · Ctrl+Z 撤销裁剪", Tool.Text => "点击画面输入文字", Tool.Color => "点击像素复制 HEX 颜色", Tool.Mosaic => "拖动覆盖需要隐藏的内容", Tool.Blur => "拖动选择局部模糊范围", _ => "拖动绘制 · Ctrl+Z 撤销" };
+        context.Text = surface.HasSelection ? Strings.T("ObjectSelectedHint") : tool switch { Tool.Select => "点击选择 · 拖动移动 · 双击文字修改", Tool.Crop => "拖动保留区域 · Ctrl+Z 撤销裁剪", Tool.Text => Strings.T("OverlayTextHint"), Tool.Color => "点击像素复制 HEX 颜色", Tool.Mosaic => "拖动覆盖需要隐藏的内容", Tool.Blur => "拖动选择局部模糊范围", _ => "拖动绘制 · Ctrl+Z 撤销" };
         status.Text = $"{Document.Crop.Width:0} × {Document.Crop.Height:0} 像素   ·   {Document.Annotations.Count} 个标注"; status.SetResourceReference(TextBlock.ForegroundProperty, "MutedBrush"); zoomLabel.Text = $"{surface.Zoom:P0}";
     }
-}
-public sealed class EditorSurface : FrameworkElement
-{
-    private readonly EditDocument document;
-    public Tool CurrentTool { get; set; }
-    public Color Ink { get; set; } = Color.FromRgb(233, 93, 117);
-    public double InkSize { get; set; } = 5;
-    public double Zoom { get; set; } = 1;
-    public Rect Visible { get; set; } = new(0, 0, 2000, 2000);
-    // The desktop overlay supplies its own frozen background; editing remains shared.
-    public bool DrawBaseImage { get; set; } = true;
-    public Annotation? HiddenAnnotation { get; set; }
-    public string TextFont { get; set; } = "Microsoft YaHei UI";
-    public double TextSize { get; set; } = 24;
-    public bool TextBold { get; set; }
-    public bool TextBackground { get; set; }
-    private Annotation? active, selected;
-    private Point start, last;
-    private bool resize;
-    private Rect cropDrag = Rect.Empty;
-    public bool HasSelection => selected != null && document.Annotations.Contains(selected);
-    public event Action? Changed;
-    public event Action<Annotation, bool>? TextRequested;
-    public event Action<MouseButtonEventArgs>? EmptySelectionDown;
-    public EditorSurface(EditDocument document)
+    private void ApplyTextStyle()
     {
-        this.document = document; Focusable = true; Cursor = Cursors.Cross;
-        MouseLeftButtonDown += Down; MouseMove += Move; MouseLeftButtonUp += Up;
-    }
-    private Point Pixel(MouseEventArgs e) { var p = e.GetPosition(this); return new(Math.Clamp(p.X / Zoom + document.Crop.X, document.Crop.Left, document.Crop.Right), Math.Clamp(p.Y / Zoom + document.Crop.Y, document.Crop.Top, document.Crop.Bottom)); }
-    public void Delete() { if (selected != null && document.Annotations.Contains(selected)) { document.Checkpoint(); document.Annotations.Remove(selected); selected = null; InvalidateVisual(); Changed?.Invoke(); } }
-    public void ClearSelection() { active = selected = null; InvalidateVisual(); }
-    public bool MoveSelection(Vector delta)
-    {
-        if (!HasSelection) return false;
-        document.Checkpoint(); selected!.Translate(delta); InvalidateVisual(); Changed?.Invoke(); return true;
-    }
-    private void Down(object sender, MouseButtonEventArgs e)
-    {
-        Focus(); start = last = Pixel(e); cropDrag = Rect.Empty;
-        if (CurrentTool == Tool.Color)
-        {
-            var b = document.Raster(new Rect(Math.Clamp((int)start.X, 0, document.Image.Width - 1), Math.Clamp((int)start.Y, 0, document.Image.Height - 1), 1, 1)); var bytes = new byte[4]; b.CopyPixels(bytes, 4, 0); Ink = Color.FromRgb(bytes[2], bytes[1], bytes[0]); Clipboard.SetText($"#{Ink.R:X2}{Ink.G:X2}{Ink.B:X2}"); Changed?.Invoke(); return;
-        }
-        if (CurrentTool == Tool.Select)
-        {
-            resize = HasSelection && (selected!.Bounds.BottomRight - start).Length < 12 / Zoom;
-            if (!resize) selected = document.Annotations.LastOrDefault(a => { var r = a.Bounds; r.Inflate(8 / Zoom, 8 / Zoom); return r.Contains(start); });
-            if (selected != null)
-            {
-                if (e.ClickCount == 2 && selected.Kind == Tool.Text) { EditText(selected, false); return; }
-                document.Checkpoint(); active = selected;
-            }
-            else if (EmptySelectionDown != null) { EmptySelectionDown(e); Changed?.Invoke(); return; }
-        }
-        else if (CurrentTool == Tool.Text)
-        {
-            var a = NewAnnotation(); EditText(a, true); return;
-        }
-        else if (CurrentTool != Tool.Crop)
-        {
-            document.Checkpoint(); active = NewAnnotation(); document.Annotations.Add(active); selected = active;
-        }
-        CaptureMouse(); InvalidateVisual();
-    }
-    private Annotation NewAnnotation() => new() { Kind = CurrentTool, Color = Ink, Stroke = Math.Max(1, InkSize / 2), EffectSize = (int)InkSize * 2, Bounds = new Rect(start, new Size(1, 1)), Points = [start], Font = TextFont, FontSize = TextSize, Bold = TextBold, Background = TextBackground };
-    private void Move(object sender, MouseEventArgs e)
-    {
-        if (!IsMouseCaptured) return; var p = Pixel(e);
-        if (CurrentTool == Tool.Crop) cropDrag = new Rect(start, p);
-        else if (active != null)
-        {
-            if (CurrentTool == Tool.Select)
-            {
-                if (resize) active.Resize(new Rect(active.Bounds.TopLeft, new Size(Math.Max(2, p.X - active.Bounds.Left), Math.Max(2, p.Y - active.Bounds.Top)))); else active.Translate(p - last);
-            }
-            else
-            {
-                if (CurrentTool is Tool.Pen or Tool.Highlighter) { active.Points.Add(p); var bounds = active.Bounds; bounds.Union(p); active.Bounds = bounds; }
-                else { active.Bounds = new Rect(start, p); active.Points = [start, p]; }
-            }
-        }
-        last = p; InvalidateVisual();
-    }
-    private void Up(object sender, MouseButtonEventArgs e)
-    {
-        if (!IsMouseCaptured) return; ReleaseMouseCapture();
-        if (CurrentTool == Tool.Crop && !cropDrag.IsEmpty && cropDrag.Width >= 2 && cropDrag.Height >= 2)
-        {
-            document.Checkpoint(); document.Crop = new Rect(Math.Floor(cropDrag.X), Math.Floor(cropDrag.Y), Math.Floor(cropDrag.Width), Math.Floor(cropDrag.Height)); cropDrag = Rect.Empty;
-        }
-        active = null; Changed?.Invoke(); InvalidateVisual();
-    }
-    private void EditText(Annotation annotation, bool add)
-    {
-        if (TextRequested != null) { TextRequested(annotation, add); return; }
-        var dialog = new TextDialog(annotation) { Owner = Window.GetWindow(this) };
-        if (dialog.ShowDialog() != true) return;
-        var draft = annotation.Clone(); draft.Text = dialog.Value; draft.FontSize = dialog.FontSizeValue; draft.Font = dialog.FontName; draft.Bold = dialog.IsBold; draft.Background = dialog.HasBackground;
-        ApplyText(annotation, draft, add);
-    }
-    public void ApplyText(Annotation annotation, Annotation draft, bool add)
-    {
-        if (add && string.IsNullOrWhiteSpace(draft.Text)) return;
-        document.Checkpoint(); annotation.Text = draft.Text; annotation.FontSize = draft.FontSize; annotation.Font = draft.Font; annotation.Color = draft.Color; annotation.Bold = draft.Bold; annotation.Background = draft.Background;
-        var formatted = new FormattedText(annotation.Text, System.Globalization.CultureInfo.CurrentCulture, FlowDirection.LeftToRight, new Typeface(new FontFamily(annotation.Font), FontStyles.Normal, annotation.Bold ? FontWeights.Bold : FontWeights.Normal, FontStretches.Normal), annotation.FontSize, Brushes.Black, 1);
-        annotation.Bounds = new Rect(annotation.Bounds.Location, new Size(Math.Max(1, formatted.WidthIncludingTrailingWhitespace), Math.Max(1, formatted.Height)));
-        if (add) document.Annotations.Add(annotation);
-        else if (string.IsNullOrWhiteSpace(annotation.Text)) document.Annotations.Remove(annotation);
-        selected = annotation; Changed?.Invoke(); InvalidateVisual();
-    }
-    protected override void OnRender(DrawingContext dc)
-    {
-        dc.DrawRectangle(Brushes.Transparent, null, new Rect(0, 0, ActualWidth, ActualHeight));
-        dc.PushTransform(new ScaleTransform(Zoom, Zoom)); dc.PushTransform(new TranslateTransform(-document.Crop.X, -document.Crop.Y));
-        if (DrawBaseImage) document.Draw(dc, Visible); else document.DrawAnnotations(dc, Visible, HiddenAnnotation);
-        if (selected != null && document.Annotations.Contains(selected))
-        {
-            var pen = new System.Windows.Media.Pen(Ui.Accent, 1 / Zoom) { DashStyle = DashStyles.Dash }; dc.DrawRectangle(null, pen, selected.Bounds);
-            dc.DrawRectangle(Brushes.White, pen, new Rect(selected.Bounds.Right - 4 / Zoom, selected.Bounds.Bottom - 4 / Zoom, 8 / Zoom, 8 / Zoom));
-        }
-        if (!cropDrag.IsEmpty) dc.DrawRectangle(new SolidColorBrush(Color.FromArgb(30, 0, 100, 255)), new System.Windows.Media.Pen(Ui.Accent, 1 / Zoom), cropDrag);
-        dc.Pop(); dc.Pop();
+        if (updatingOptions || !double.TryParse(textSize.Text, out var value) || !double.IsFinite(value) || value < 8 || value > 300) return;
+        surface.SetTextStyle(string.IsNullOrWhiteSpace(textFont.Text) ? "Microsoft YaHei UI" : textFont.Text, value, bold.IsChecked == true, background.IsChecked == true);
     }
 }
-
 internal sealed class TextDialog : Window
 {
     private readonly TextBox text = new() { AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 120, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };

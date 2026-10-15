@@ -154,7 +154,7 @@ public sealed class App : Application
     }
     public async void Remember(EditDocument doc)
     {
-        var signature = System.Text.Json.JsonSerializer.Serialize(new { doc.Crop, Objects = doc.Annotations.Select(a => new { a.Id, a.Kind, a.Bounds, a.Text, a.Color, a.Stroke, a.Font, a.FontSize, a.Bold, a.Background, a.EffectSize, a.Points }) });
+        var signature = System.Text.Json.JsonSerializer.Serialize(new { doc.Crop, Objects = doc.Annotations.Select(a => new { a.Id, a.Kind, a.Bounds, a.Text, a.Color, a.Stroke, a.Font, a.FontSize, a.Bold, a.Background, a.TextWidth, a.Rotation, a.FlipX, a.FlipY, a.EffectSize, a.Points }) });
         var revision = historyRevisions.GetOrCreateValue(doc); if (revision.Signature == signature) return;
         var snapshot = doc.Fork(); var configuration = Settings; revision.Signature = signature; historyJobs++;
         await historyQueue.WaitAsync();
