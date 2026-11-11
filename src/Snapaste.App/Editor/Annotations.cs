@@ -15,6 +15,10 @@ public sealed class Annotation
     public string Font { get; set; } = "Microsoft YaHei UI";
     public double FontSize { get; set; } = 24;
     public bool Bold { get; set; }
+    public bool Italic { get; set; }
+    public bool Underline { get; set; }
+    public TextAlignment Alignment { get; set; } = TextAlignment.Left;
+    public double TextIndent { get; set; }
     public bool Background { get; set; }
     public double TextWidth { get; set; }
     public double Rotation { get; set; }
@@ -27,7 +31,14 @@ public sealed class Annotation
     private bool effectPreview, effectBusy;
     private (Rect Area, int Size)? failedPreview;
     private static readonly SemaphoreSlim PreviewWorkers = new(1, 1);
-    public Annotation Clone() => new() { Id = Id, Kind = Kind, Bounds = Bounds, Points = [.. Points], Color = Color, Stroke = Stroke, Text = Text, Font = Font, FontSize = FontSize, Bold = Bold, Background = Background, TextWidth = TextWidth, Rotation = Rotation, FlipX = FlipX, FlipY = FlipY, EffectSize = EffectSize };
+    public Annotation Clone() => new()
+    {
+        Id = Id, Kind = Kind, Bounds = Bounds, Points = [.. Points], Color = Color, Stroke = Stroke,
+        Text = Text, Font = Font, FontSize = FontSize, Bold = Bold, Italic = Italic, Underline = Underline,
+        Alignment = Alignment, TextIndent = TextIndent, Background = Background, TextWidth = TextWidth,
+        Rotation = Rotation, FlipX = FlipX, FlipY = FlipY, EffectSize = EffectSize
+    };
+
     public Matrix Transform
     {
         get
@@ -41,19 +52,46 @@ public sealed class Annotation
     public Point ToWorld(Point point) => Transform.Transform(point);
     public Point ToLocal(Point point) { var inverse = Transform; inverse.Invert(); return inverse.Transform(point); }
     public Rect VisualBounds => new MatrixTransform(Transform).TransformBounds(Bounds);
-    public FormattedText FormatText(Brush brush)
+    private double FixedTextWidth => double.IsFinite(TextWidth) && TextWidth > 0 ? Math.Max(1, TextWidth) : 0;
+
+    public double TextInset
     {
-        var text = new FormattedText(Text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, new Typeface(new FontFamily(Font), FontStyles.Normal, Bold ? FontWeights.Bold : FontWeights.Normal, FontStretches.Normal), FontSize, brush, 1);
-        if (TextWidth > 0) text.MaxTextWidth = Math.Clamp(TextWidth, 1, 30000);
-        return text;
+        get
+        {
+            double indent = double.IsFinite(TextIndent) ? Math.Max(0, TextIndent) : 0;
+            return FixedTextWidth > 0 ? Math.Min(indent, FixedTextWidth - 1) : indent;
+        }
     }
+
+    public FormattedText FormatText(Brush brush) => LayoutText(brush).Text;
+
+    private (FormattedText Text, double Width) LayoutText(Brush brush)
+    {
+        var typeface = new Typeface(new FontFamily(Font), Italic ? FontStyles.Italic : FontStyles.Normal,
+            Bold ? FontWeights.Bold : FontWeights.Normal, FontStretches.Normal);
+        var text = new FormattedText(Text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface, FontSize, brush, 1)
+        {
+            Trimming = TextTrimming.None
+        };
+        if (Underline) text.SetTextDecorations(TextDecorations.Underline);
+
+        double inset = TextInset;
+        double width = FixedTextWidth;
+        // Give centered and right-aligned automatic text the same frame as
+        // left-aligned text, based on the longest line's unaligned width.
+        if (width == 0) width = inset + Math.Max(1, Math.Ceiling(text.WidthIncludingTrailingWhitespace));
+        text.MaxTextWidth = Math.Max(1, width - inset);
+        text.TextAlignment = Alignment;
+        return (text, width);
+    }
+
     public void MeasureText()
     {
         // Editing/reflow grows along the object's own axes. Keep its visual
         // top-left fixed even though the bounds-based rotation pivot changes.
         var origin = ToWorld(Bounds.TopLeft);
-        var text = FormatText(Brushes.Black);
-        Bounds = new Rect(Bounds.Location, new Size(Math.Max(1, TextWidth > 0 ? TextWidth : text.WidthIncludingTrailingWhitespace), Math.Max(1, text.Height)));
+        var (text, width) = LayoutText(Brushes.Black);
+        Bounds = new Rect(Bounds.Location, new Size(width, Math.Max(1, text.Height)));
         Translate(origin - ToWorld(Bounds.TopLeft));
     }
     public bool HitTest(Point point, double tolerance)
@@ -129,7 +167,7 @@ public sealed class Annotation
             case Tool.Text:
                 var text = FormatText(brush);
                 if (Background) dc.DrawRectangle(new SolidColorBrush(Colors.White) { Opacity = .9 }, null, Bounds);
-                dc.DrawText(text, Bounds.Location); break;
+                dc.DrawText(text, new Point(Bounds.X + TextInset, Bounds.Y)); break;
         }
         dc.Pop();
     }

@@ -321,7 +321,16 @@ public sealed class App : Application
     private async Task RememberAsync(EditDocument doc)
     {
         if (!Settings.HistoryEnabled) return;
-        var signature = System.Text.Json.JsonSerializer.Serialize(new { doc.Crop, Objects = doc.Annotations.Select(a => new { a.Id, a.Kind, a.Bounds, a.Text, a.Color, a.Stroke, a.Font, a.FontSize, a.Bold, a.Background, a.TextWidth, a.Rotation, a.FlipX, a.FlipY, a.EffectSize, a.Points }) });
+        var signature = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            doc.Crop,
+            Objects = doc.Annotations.Select(a => new
+            {
+                a.Id, a.Kind, a.Bounds, a.Text, a.Color, a.Stroke, a.Font, a.FontSize, a.Bold,
+                a.Italic, a.Underline, a.Alignment, a.TextIndent, a.Background, a.TextWidth,
+                a.Rotation, a.FlipX, a.FlipY, a.EffectSize, a.Points
+            })
+        });
         var revision = historyRevisions.GetOrCreateValue(doc);
         if (revision.Signature == signature) return;
         var snapshot = doc.Fork();

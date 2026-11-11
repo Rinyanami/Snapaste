@@ -16,6 +16,10 @@ public sealed class EditorSurface : FrameworkElement
     public double TextSize { get; set; } = 24;
     public bool TextBold { get; set; }
     public bool TextBackground { get; set; }
+    public bool TextItalic { get; set; }
+    public bool TextUnderline { get; set; }
+    public TextAlignment TextAlignment { get; set; } = TextAlignment.Left;
+    public double TextIndent { get; set; }
     private Annotation? active, selected, original;
     private EditSnapshot? pointerBefore;
     private Point start;
@@ -83,11 +87,18 @@ public sealed class EditorSurface : FrameworkElement
             ChangeStyle(x => x.Stroke = Math.Max(1, value / 2));
         else Notify();
     }
-    public void SetTextStyle(string font, double size, bool bold, bool background)
+    public void SetTextStyle(string font, double size, bool bold, bool background, bool? italic = null, bool? underline = null, TextAlignment? alignment = null, double? indent = null)
     {
+        var current = Selection is { Kind: Tool.Text } text ? text : null;
+        TextItalic = italic ?? current?.Italic ?? TextItalic;
+        TextUnderline = underline ?? current?.Underline ?? TextUnderline;
+        TextAlignment = alignment ?? current?.Alignment ?? TextAlignment;
+        double requestedIndent = indent ?? current?.TextIndent ?? TextIndent;
+        TextIndent = double.IsFinite(requestedIndent) ? Math.Clamp(requestedIndent, 0, 1000) : 0;
         TextFont = font; TextSize = size; TextBold = bold; TextBackground = background;
-        if (Selection is { Kind: Tool.Text } a && (a.Font != font || a.FontSize != size || a.Bold != bold || a.Background != background))
-            ChangeStyle(x => { x.Font = font; x.FontSize = size; x.Bold = bold; x.Background = background; x.MeasureText(); });
+        if (current is { } a && (a.Font != font || a.FontSize != size || a.Bold != bold || a.Background != background ||
+            a.Italic != TextItalic || a.Underline != TextUnderline || a.Alignment != TextAlignment || a.TextIndent != TextIndent))
+            ChangeStyle(x => { x.Font = font; x.FontSize = size; x.Bold = bold; x.Background = background; x.Italic = TextItalic; x.Underline = TextUnderline; x.Alignment = TextAlignment; x.TextIndent = TextIndent; x.MeasureText(); });
         else Notify();
     }
     public void RotateSelection(double degrees) { if (Selection is not { } a) return; document.Checkpoint(); a.Rotation = (a.Rotation + degrees) % 360; Notify(); }
@@ -102,7 +113,7 @@ public sealed class EditorSurface : FrameworkElement
     // Handles are evaluated in physical image coordinates, independently of the host's DPI.
     private int HitHandle(Point p)
     {
-        if (Selection is not { } a) return -1;
+        if (Selection is not { } a || CurrentTool == Tool.Text && a.Kind != Tool.Text) return -1;
         double radius = 8 / Zoom;
         if ((p - RotationHandle(a)).Length <= radius) return 8;
         if (a.Kind is Tool.Arrow or Tool.Line && a.Points.Count >= 2)
@@ -117,6 +128,9 @@ public sealed class EditorSurface : FrameworkElement
     private Annotation? FindAnnotation(Point point)
     {
         if (CurrentTool is Tool.Crop or Tool.Color) return null;
+        // Text placement must not turn into moving an ellipse, its outline, or
+        // another drawing. Existing text remains selectable for later editing.
+        if (CurrentTool == Tool.Text) return document.Annotations.LastOrDefault(a => a.Kind == Tool.Text && a.HitTest(point, 6 / Zoom));
         // Visible strokes win over hollow interiors, so nested objects remain
         // reachable. A selected shape can be dragged anywhere inside it.
         var hit = document.Annotations.LastOrDefault(a => a.HitTest(point, 6 / Zoom));
@@ -129,15 +143,22 @@ public sealed class EditorSurface : FrameworkElement
     {
         Focus(); var p = Pixel(e);
         if (CurrentTool == Tool.Select && !HasSelection && FindAnnotation(p) == null && EmptySelectionDown != null) { EmptySelectionDown(e); return; }
-        if (BeginPointer(p, e.ClickCount)) CaptureMouse(); e.Handled = true;
+        if (BeginPointer(p, e.ClickCount) && !CaptureMouse()) CancelPointer(); e.Handled = true;
     }
     internal bool BeginPointer(Point point, int clicks = 1)
     {
         EndStyleEdit(); CancelPointer(); start = point;
+        if (CurrentTool == Tool.Text && Selection is { Kind: not Tool.Text }) selected = null;
         if (CurrentTool == Tool.Color)
         {
             var p = Clamp(point); var b = document.Raster(new Rect(Math.Clamp((int)p.X, 0, document.Image.Width - 1), Math.Clamp((int)p.Y, 0, document.Image.Height - 1), 1, 1)); var bytes = new byte[4]; b.CopyPixels(bytes, 4, 0);
             SetColor(Color.FromRgb(bytes[2], bytes[1], bytes[0])); Clipboard.SetText($"#{Ink.R:X2}{Ink.G:X2}{Ink.B:X2}"); return false;
+        }
+        // At small sizes all of a text object may be within its resize handles.
+        // A deliberate double-click must still reach its editable contents.
+        if (clicks >= 2 && CurrentTool is Tool.Select or Tool.Text && FindAnnotation(point) is { Kind: Tool.Text } editable)
+        {
+            selected = editable; EditText(editable, false); Notify(); return false;
         }
         handle = HitHandle(point);
         if (handle >= 0)
@@ -161,7 +182,7 @@ public sealed class EditorSurface : FrameworkElement
         }
         original = gesture == Gesture.Draw ? null : active?.Clone(); Notify(); return true;
     }
-    private Annotation NewAnnotation(Tool tool) => new() { Kind = tool, Color = Ink, Stroke = Math.Max(1, InkSize / 2), EffectSize = Math.Clamp((int)Math.Round(InkSize * 2), 2, 64), Bounds = new Rect(start, new Size(1, 1)), Points = [start], Font = TextFont, FontSize = TextSize, Bold = TextBold, Background = TextBackground };
+    private Annotation NewAnnotation(Tool tool) => new() { Kind = tool, Color = Ink, Stroke = Math.Max(1, InkSize / 2), EffectSize = Math.Clamp((int)Math.Round(InkSize * 2), 2, 64), Bounds = new Rect(start, new Size(1, 1)), Points = [start], Font = TextFont, FontSize = TextSize, Bold = TextBold, Background = TextBackground, Italic = TextItalic, Underline = TextUnderline, Alignment = TextAlignment, TextIndent = TextIndent };
     private void Move(object sender, MouseEventArgs e)
     {
         var p = Pixel(e);
@@ -235,11 +256,11 @@ public sealed class EditorSurface : FrameworkElement
     private static void RestoreGeometry(Annotation a, Annotation before)
     {
         a.Bounds = before.Bounds; a.Points = [.. before.Points]; a.Rotation = before.Rotation; a.FlipX = before.FlipX; a.FlipY = before.FlipY;
-        a.FontSize = before.FontSize; a.TextWidth = before.TextWidth;
+        a.FontSize = before.FontSize; a.TextWidth = before.TextWidth; a.TextIndent = before.TextIndent;
     }
     private static bool GeometryChanged(Annotation a, Annotation before) =>
         a.Bounds != before.Bounds || (a.Rotation - before.Rotation) % 360 != 0 || a.FlipX != before.FlipX || a.FlipY != before.FlipY
-        || a.FontSize != before.FontSize || a.TextWidth != before.TextWidth || !a.Points.SequenceEqual(before.Points);
+        || a.FontSize != before.FontSize || a.TextWidth != before.TextWidth || a.TextIndent != before.TextIndent || !a.Points.SequenceEqual(before.Points);
     internal static void ResizeSelection(Annotation a, Annotation before, int index, Point world)
     {
         var p = before.ToLocal(world); var r = before.Bounds;
@@ -252,6 +273,7 @@ public sealed class EditorSurface : FrameworkElement
         if (a.Kind == Tool.Text)
         {
             if (index is not (3 or 7)) a.FontSize = Math.Clamp(before.FontSize * next.Height / Math.Max(1, r.Height), 8, 300);
+            a.TextIndent = Math.Clamp(before.TextIndent * a.FontSize / Math.Max(1, before.FontSize), 0, 1000);
             a.TextWidth = next.Width; a.MeasureText();
         }
         int opposite = (index + 4) % 8;
@@ -309,16 +331,19 @@ public sealed class EditorSurface : FrameworkElement
         var dialog = new TextDialog(annotation) { Owner = Window.GetWindow(this) };
         if (dialog.ShowDialog() != true) return;
         var draft = annotation.Clone(); draft.Text = dialog.Value; draft.FontSize = dialog.FontSizeValue; draft.Font = dialog.FontName; draft.Bold = dialog.IsBold; draft.Background = dialog.HasBackground;
+        draft.Italic = dialog.IsItalic; draft.Underline = dialog.IsUnderlined; draft.Alignment = dialog.Alignment; draft.TextIndent = dialog.Indent; draft.Color = dialog.TextColor;
         ApplyText(annotation, draft, add);
     }
     public void ApplyText(Annotation annotation, Annotation draft, bool add)
     {
         EndStyleEdit();
         if (add && string.IsNullOrWhiteSpace(draft.Text)) return;
-        bool different = add || annotation.Text != draft.Text || annotation.FontSize != draft.FontSize || annotation.Font != draft.Font || annotation.Color != draft.Color || annotation.Bold != draft.Bold || annotation.Background != draft.Background || annotation.TextWidth != draft.TextWidth;
+        bool different = add || annotation.Text != draft.Text || annotation.FontSize != draft.FontSize || annotation.Font != draft.Font || annotation.Color != draft.Color || annotation.Bold != draft.Bold || annotation.Background != draft.Background || annotation.TextWidth != draft.TextWidth ||
+            annotation.Italic != draft.Italic || annotation.Underline != draft.Underline || annotation.Alignment != draft.Alignment || annotation.TextIndent != draft.TextIndent;
         if (different)
         {
             document.Checkpoint(); annotation.Text = draft.Text; annotation.FontSize = draft.FontSize; annotation.Font = draft.Font; annotation.Color = draft.Color; annotation.Bold = draft.Bold; annotation.Background = draft.Background; annotation.TextWidth = draft.TextWidth;
+            annotation.Italic = draft.Italic; annotation.Underline = draft.Underline; annotation.Alignment = draft.Alignment; annotation.TextIndent = draft.TextIndent;
             annotation.MeasureText();
             if (add) document.Annotations.Add(annotation); else if (string.IsNullOrWhiteSpace(annotation.Text)) document.Annotations.Remove(annotation);
         }
