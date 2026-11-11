@@ -33,6 +33,8 @@ public sealed class CaptureOverlay : Window
     private Rect selected = Rect.Empty, candidate = Rect.Empty, initial;
     private Point start, pointer;
     private bool dragging;
+    private EditSnapshot? cropBefore;
+    private Rect initialCrop;
     private int handle = -2, detectionMode;
     private nint target;
     private DateTime lastDetection;
@@ -74,7 +76,7 @@ public sealed class CaptureOverlay : Window
         annotations.EmptySelectionDown += e => { if (e.ClickCount == 2) Finish("Copy"); else BeginDrag(e); e.Handled = true; };
         surface.MouseLeftButtonDown += (_, e) => BeginDrag(e);
         surface.MouseLeftButtonUp += Up; surface.MouseMove += Move;
-        surface.LostMouseCapture += (_, _) => { if (dragging) { dragging = false; annotations.IsHitTestVisible = true; UpdateCrop(); Refresh(); } };
+        surface.LostMouseCapture += (_, _) => { if (dragging) CancelCropDrag(); };
         PreviewMouseLeftButtonDown += (_, e) =>
         {
             if (Within(e.OriginalSource, toolbar) || Within(e.OriginalSource, textInput)) return;
@@ -127,8 +129,15 @@ public sealed class CaptureOverlay : Window
         font.ItemsSource = Fonts.SystemFontFamilies.Select(f => f.Source).Order().ToList(); font.Text = annotations.TextFont;
         fontSize.ItemsSource = new[] { "12", "16", "20", "24", "32", "48", "64", "96" }; fontSize.Text = "24";
         foreach (var control in new FrameworkElement[] { font, fontSize, bold, textBackground }) textOptions.Children.Add(control);
-        font.AddHandler(TextBox.TextChangedEvent, new TextChangedEventHandler((_, _) => ApplyTextOptions()));
-        fontSize.AddHandler(TextBox.TextChangedEvent, new TextChangedEventHandler((_, _) => ApplyTextOptions()));
+        Ui.ObserveText(font, this, () => ApplyTextOptions()); Ui.ObserveText(fontSize, this, () => ApplyTextOptions(true));
+        foreach (var control in new[] { font, fontSize })
+        {
+            control.GotKeyboardFocus += (_, _) => annotations.BeginStyleEdit();
+            control.LostKeyboardFocus += (_, _) => { annotations.EndStyleEdit(); UpdateOptions(); };
+        }
+        System.Windows.Automation.AutomationProperties.SetName(font, Strings.T("Font"));
+        System.Windows.Automation.AutomationProperties.SetName(fontSize, Strings.T("FontSize"));
+        fontSize.ToolTip = Strings.T("FontSize") + " · 8–300";
         bold.Checked += (_, _) => ApplyTextOptions(); bold.Unchecked += (_, _) => ApplyTextOptions();
         textBackground.Checked += (_, _) => ApplyTextOptions(); textBackground.Unchecked += (_, _) => ApplyTextOptions();
         hint.VerticalAlignment = VerticalAlignment.Center; hint.Margin = new Thickness(10, 3, 5, 3);
@@ -156,9 +165,9 @@ public sealed class CaptureOverlay : Window
     private void BeginDrag(MouseButtonEventArgs e)
     {
         if (exporting) return;
-        CommitText(); start = pointer = Physical(e); initial = selected; handle = Hit(start);
+        CommitText(); start = pointer = Physical(e); initial = selected; initialCrop = Document.Crop; handle = Hit(start);
         if (handle == -2) { target = 0; annotations.ClearSelection(); }
-        if (!selected.IsEmpty || Document.Annotations.Count > 0) Document.Checkpoint();
+        cropBefore = null;
         dragging = true; surface.CaptureMouse(); toolbar.Visibility = Visibility.Collapsed; annotations.IsHitTestVisible = false;
     }
     private void Move(object sender, MouseEventArgs e)
@@ -176,7 +185,7 @@ public sealed class CaptureOverlay : Window
                 if (handle is 2 or 3 or 4) r += delta.X; if (handle is 4 or 5 or 6) b += delta.Y;
                 selected = Normalize(new(l, t), new(r, b));
             }
-            UpdateCrop(); PlaceAnnotations();
+            CheckpointCropChange(); UpdateCrop(); PlaceAnnotations();
         }
         else if (selected.IsEmpty && detectionMode < 2 && (DateTime.UtcNow - lastDetection).TotalMilliseconds > 70)
         {
@@ -192,8 +201,29 @@ public sealed class CaptureOverlay : Window
         if (!dragging) return;
         dragging = false; surface.ReleaseMouseCapture(); annotations.IsHitTestVisible = true;
         if ((pointer - start).Length < 4 && handle == -2) selected = candidate;
-        if (selected.IsEmpty || selected.Width < 2 || selected.Height < 2) { selected = Rect.Empty; annotations.Visibility = Visibility.Collapsed; RefreshVisuals(); return; }
-        UpdateCrop(); if (scrollMode) { Finish("Scroll"); return; } Refresh();
+        if (selected.IsEmpty || selected.Width < 2 || selected.Height < 2)
+        {
+            selected = initial; Document.Crop = initialCrop; cropBefore = null;
+            if (selected.IsEmpty) { annotations.Visibility = toolbar.Visibility = Visibility.Collapsed; RefreshVisuals(); } else Refresh();
+            return;
+        }
+        CheckpointCropChange(); UpdateCrop();
+        if (cropBefore != null && cropBefore.Crop != Document.Crop) Document.CommitState(cropBefore);
+        cropBefore = null;
+        if (scrollMode) { Finish("Scroll"); return; } Refresh();
+    }
+    private void CheckpointCropChange()
+    {
+        if (cropBefore != null || selected.IsEmpty || selected.Width < 1 || selected.Height < 1 || initial.IsEmpty && Document.Annotations.Count == 0) return;
+        var pixels = new Rect(new Point(Math.Floor(selected.Left) - screen.X, Math.Floor(selected.Top) - screen.Y), new Point(Math.Ceiling(selected.Right) - screen.X, Math.Ceiling(selected.Bottom) - screen.Y));
+        if (pixels == Document.Crop) return;
+        cropBefore = Document.CaptureState();
+    }
+    private void CancelCropDrag()
+    {
+        if (!dragging) return;
+        dragging = false; surface.ReleaseMouseCapture(); annotations.IsHitTestVisible = true;
+        selected = initial; Document.Crop = initialCrop; cropBefore = null; Refresh();
     }
     private void UpdateCrop()
     {
@@ -205,7 +235,7 @@ public sealed class CaptureOverlay : Window
     }
     private void PlaceAnnotations()
     {
-        if (selected.IsEmpty) { annotations.Visibility = Visibility.Collapsed; return; }
+        if (selected.IsEmpty || selected.Width < 1 || selected.Height < 1) { annotations.Visibility = Visibility.Collapsed; return; }
         var r = Local(selected); annotations.Zoom = r.Width / selected.Width; annotations.Width = r.Width; annotations.Height = r.Height;
         annotations.Visible = Document.Crop; annotations.Visibility = Visibility.Visible;
         Canvas.SetLeft(annotations, r.Left); Canvas.SetTop(annotations, r.Top); annotations.InvalidateVisual();
@@ -229,7 +259,7 @@ public sealed class CaptureOverlay : Window
     }
     private void SelectTool(Tool tool)
     {
-        CommitText(); annotations.CurrentTool = tool; annotations.Cursor = tool == Tool.Select ? Cursors.Arrow : tool == Tool.Text ? Cursors.IBeam : Cursors.Cross;
+        CancelCropDrag(); annotations.CancelPointer(); CommitText(); annotations.CurrentTool = tool; annotations.Cursor = tool == Tool.Select ? Cursors.Arrow : tool == Tool.Text ? Cursors.IBeam : Cursors.Cross;
         if (tool is Tool.Crop or Tool.Color) annotations.ClearSelection(); annotations.Focus(); Refresh();
     }
     private void UpdateOptions()
@@ -238,15 +268,17 @@ public sealed class CaptureOverlay : Window
         foreach (var pair in tools) pair.Value.Tag = pair.Key == annotations.CurrentTool ? "Selected" : null;
         foreach (var color in colors) color.Button.BorderBrush = color.Color == (textInput != null ? annotations.Ink : annotations.DisplayColor) ? Ui.Accent : Brushes.Transparent;
         updatingTextOptions = true;
+        sizeSlider.Maximum = tool is Tool.Blur or Tool.Mosaic ? 32 : 40;
         sizeSlider.Value = Math.Clamp(annotations.DisplaySize, sizeSlider.Minimum, sizeSlider.Maximum);
         if (textInput == null)
         {
             var a = annotations.Selection;
-            font.Text = a?.Kind == Tool.Text ? a.Font : annotations.TextFont; fontSize.Text = (a?.Kind == Tool.Text ? a.FontSize : annotations.TextSize).ToString("0.#", CultureInfo.InvariantCulture);
+            if (!font.IsKeyboardFocusWithin) font.Text = a?.Kind == Tool.Text ? a.Font : annotations.TextFont;
+            if (!fontSize.IsKeyboardFocusWithin) fontSize.Text = (a?.Kind == Tool.Text ? a.FontSize : annotations.TextSize).ToString("0.###", CultureInfo.InvariantCulture);
             bold.IsChecked = a?.Kind == Tool.Text ? a.Bold : annotations.TextBold; textBackground.IsChecked = a?.Kind == Tool.Text ? a.Background : annotations.TextBackground;
         }
         updatingTextOptions = false; transforms.Refresh(textInput == null);
-        undo.IsEnabled = Document.CanUndo || textInput != null; redo.IsEnabled = Document.CanRedo; delete.IsEnabled = annotations.HasSelection;
+        undo.IsEnabled = textInput?.CanUndo ?? Document.CanUndo; redo.IsEnabled = textInput?.CanRedo ?? Document.CanRedo; delete.IsEnabled = annotations.HasSelection;
         palette.Visibility = textInput == null && (tool is Tool.Select or Tool.Crop or Tool.Mosaic or Tool.Blur) ? Visibility.Collapsed : Visibility.Visible;
         sizeOptions.Visibility = tool is Tool.Select or Tool.Crop or Tool.Text or Tool.Color ? Visibility.Collapsed : Visibility.Visible;
         textOptions.Visibility = tool == Tool.Text || textInput != null ? Visibility.Visible : Visibility.Collapsed;
@@ -255,7 +287,12 @@ public sealed class CaptureOverlay : Window
     }
     private void History(bool forward)
     {
-        CommitText(); if (forward) Document.Redo(); else Document.Undo(); Refresh();
+        if (textInput != null)
+        {
+            if (forward) textInput.Redo(); else textInput.Undo();
+            textInput.Focus(); UpdateOptions(); return;
+        }
+        CancelCropDrag(); annotations.CancelPointer(); annotations.EndStyleEdit(); if (forward) Document.Redo(); else Document.Undo(); Refresh();
     }
     private static Tool? KeyTool(Key key) => key switch { System.Windows.Input.Key.V => Tool.Select, System.Windows.Input.Key.R => Tool.Rectangle, System.Windows.Input.Key.E => Tool.Ellipse, System.Windows.Input.Key.L => Tool.Line, System.Windows.Input.Key.A => Tool.Arrow, System.Windows.Input.Key.P => Tool.Pen, System.Windows.Input.Key.H => Tool.Highlighter, System.Windows.Input.Key.T => Tool.Text, System.Windows.Input.Key.M => Tool.Mosaic, System.Windows.Input.Key.B => Tool.Blur, System.Windows.Input.Key.X => Tool.Crop, System.Windows.Input.Key.I => Tool.Color, _ => null };
     private void Key(object sender, KeyEventArgs e)
@@ -282,13 +319,15 @@ public sealed class CaptureOverlay : Window
         else if (Keyboard.Modifiers == ModifierKeys.None && KeyTool(e.Key) is Tool tool) { SelectTool(tool); e.Handled = true; }
         else if (e.Key is System.Windows.Input.Key.Left or System.Windows.Input.Key.Right or System.Windows.Input.Key.Up or System.Windows.Input.Key.Down)
         {
-            CommitText(); int step = control ? 10 : 1;
+            CancelCropDrag(); CommitText(); int step = control ? 10 : 1;
             double dx = e.Key == System.Windows.Input.Key.Left ? -step : e.Key == System.Windows.Input.Key.Right ? step : 0, dy = e.Key == System.Windows.Input.Key.Up ? -step : e.Key == System.Windows.Input.Key.Down ? step : 0;
             if (!annotations.MoveSelection(new(dx, dy)))
             {
-                Document.Checkpoint();
-                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) selected = Rect.Intersect(new Rect(selected.X, selected.Y, Math.Max(2, selected.Width + dx), Math.Max(2, selected.Height + dy)), screen);
-                else { selected.Offset(dx, dy); selected = Clamp(selected); }
+                var next = selected;
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) next = Rect.Intersect(new Rect(next.X, next.Y, Math.Max(2, next.Width + dx), Math.Max(2, next.Height + dy)), screen);
+                else { next.Offset(dx, dy); next = Clamp(next); }
+                if (next == selected) { e.Handled = true; return; }
+                Document.Checkpoint(); selected = next;
                 UpdateCrop(); Refresh();
             }
             e.Handled = true;
@@ -305,14 +344,18 @@ public sealed class CaptureOverlay : Window
         textInput = new TextBox { Text = annotation.Text, AcceptsReturn = true, TextWrapping = annotation.TextWidth > 0 ? TextWrapping.Wrap : TextWrapping.NoWrap, Padding = new Thickness(0), BorderThickness = new Thickness(1), MinWidth = 24, MinHeight = 24 };
         textInput.SetResourceReference(Control.BorderBrushProperty, "AccentBrush");
         InputMethod.SetIsInputMethodEnabled(textInput, true);
+        System.Windows.Automation.AutomationProperties.SetName(textInput, Strings.T("Text"));
+        textInput.TextChanged += (_, _) => UpdateOptions();
         root.Children.Add(textInput); Panel.SetZIndex(textInput, 2);
         ApplyTextOptions(); Refresh(); textInput.Focus(); textInput.CaretIndex = textInput.Text.Length;
     }
-    private void ApplyTextOptions()
+    private void ApplyTextOptions(bool readSize = false)
     {
         if (updatingTextOptions) return;
         annotations.TextFont = string.IsNullOrWhiteSpace(font.Text) ? "Microsoft YaHei UI" : font.Text;
-        if (!double.TryParse(fontSize.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var size) || !double.IsFinite(size) || size < 8 || size > 300) return;
+        double current = textDraft?.FontSize ?? (annotations.Selection is { Kind: Tool.Text } a ? a.FontSize : annotations.TextSize);
+        double size = current;
+        if (readSize && !Ui.TryFontSize(fontSize.Text, out size)) return;
         annotations.TextSize = size;
         annotations.TextBold = bold.IsChecked == true; annotations.TextBackground = textBackground.IsChecked == true;
         if (textInput == null || textDraft == null) { annotations.SetTextStyle(annotations.TextFont, annotations.TextSize, annotations.TextBold, annotations.TextBackground); return; }
@@ -348,7 +391,7 @@ public sealed class CaptureOverlay : Window
     }
     private async void Finish(string action)
     {
-        if (exporting || selected.IsEmpty || Accepted == null) return;
+        if (exporting || selected.IsEmpty || selected.Width < 1 || selected.Height < 1 || Accepted == null) return;
         CommitText();
         if (action == "Scroll")
         {

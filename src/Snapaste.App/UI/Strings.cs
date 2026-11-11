@@ -26,7 +26,7 @@ public static class Strings
         ["CopyFinishHint"] = "复制并完成 · Enter / Ctrl+C",
         ["CaptureFlowHint"] = "选区内直接标注 · Enter / 双击空白复制 · 方向键微调边界。",
         ["StrokeSize"] = "线宽", ["BlockSize"] = "块大小", ["BlurSize"] = "模糊强度",
-        ["InlineTextHint"] = "Ctrl+Enter 确认 · Esc 放弃文字",
+        ["InlineTextHint"] = "点空白结束输入 · Ctrl+Enter 确认 · Esc 放弃",
         ["OverlaySelectHint"] = "拖动移动 · 双击空白复制 · 方向键微调",
         ["OverlayCropHint"] = "拖动保留区域 · Ctrl+Z 撤销裁剪",
         ["OverlayColorHint"] = "点击像素复制 HEX · C 取底图颜色",
@@ -41,6 +41,15 @@ public static class Strings
         ["ScrollFreshCapture"] = "滚动截图需要重新捕获页面，当前普通截图的标注不会带入。开始新的滚动截图吗？",
         ["DesktopLocked"] = "桌面已锁定，无法捕获画面。请解锁 Windows 后重试。",
         ["DesktopDisconnected"] = "桌面会话已断开，无法捕获画面。请恢复桌面连接后重试。",
+        ["StartCapture"] = "开始截图",
+        ["SettingsQuickStart"] = "拖动框选，按 Enter 复制，再到聊天或文档里按 Ctrl+V 粘贴。",
+        ["SettingsTrayHint"] = "关闭设置后，可双击任务栏右下角的 Snapaste 图标截图。",
+        ["HistoryRefreshing"] = "正在读取截图历史…",
+        ["HistoryRefreshFailed"] = "暂时无法读取截图历史，请重试。",
+        ["HistoryPreviewLoading"] = "正在读取预览…",
+        ["HistoryPreviewUnavailable"] = "预览不可用",
+        ["EffectPreviewWorking"] = "正在生成预览…",
+        ["EffectPreviewFailed"] = "预览失败，请缩小区域",
     };
     public static string T(string key) => Zh.GetValueOrDefault(key, key);
 }

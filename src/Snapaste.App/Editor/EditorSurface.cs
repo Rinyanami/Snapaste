@@ -17,11 +17,12 @@ public sealed class EditorSurface : FrameworkElement
     public bool TextBold { get; set; }
     public bool TextBackground { get; set; }
     private Annotation? active, selected, original;
+    private EditSnapshot? pointerBefore;
     private Point start;
     private Rect cropDrag = Rect.Empty;
     private Gesture gesture;
     private int handle;
-    private bool checkpointed, styleEditing, styleCheckpointed;
+    private bool styleEditing, styleCheckpointed;
     private enum Gesture { None, Move, Resize, Rotate, Endpoint, Draw, Text, Crop }
     public Annotation? Selection
     {
@@ -44,9 +45,20 @@ public sealed class EditorSurface : FrameworkElement
     private Point Clamp(Point p) => new(Math.Clamp(p.X, document.Crop.Left, document.Crop.Right), Math.Clamp(p.Y, document.Crop.Top, document.Crop.Bottom));
     private void Notify() { InvalidateVisual(); Changed?.Invoke(); }
     public void SelectAnnotation(Annotation annotation) { selected = document.Annotations.FirstOrDefault(a => a.Id == annotation.Id); Notify(); }
-    public void ClearSelection() { selected = active = original = null; gesture = Gesture.None; if (IsMouseCaptured) ReleaseMouseCapture(); Notify(); }
-    public void Delete() { if (Selection is not { } a) return; document.Checkpoint(); document.Annotations.Remove(a); ClearSelection(); }
-    public bool MoveSelection(Vector delta) { if (Selection is not { } a) return false; document.Checkpoint(); a.Translate(delta); Notify(); return true; }
+    public void ClearSelection() { CancelPointer(); selected = null; Notify(); }
+    public void Delete()
+    {
+        CancelPointer();
+        if (Selection is not { } a) return;
+        document.Checkpoint(); document.Annotations.Remove(a); selected = null; Notify();
+    }
+    public bool MoveSelection(Vector delta)
+    {
+        CancelPointer();
+        if (Selection is not { } a) return false;
+        if (delta.LengthSquared > 0) { document.Checkpoint(); a.Translate(delta); Notify(); }
+        return true;
+    }
     public void BeginStyleEdit() { styleEditing = true; styleCheckpointed = false; }
     public void EndStyleEdit() { styleEditing = styleCheckpointed = false; }
     private void ChangeStyle(Action<Annotation> change)
@@ -62,8 +74,13 @@ public sealed class EditorSurface : FrameworkElement
     public void SetSize(double value)
     {
         InkSize = value;
-        if (Selection is { } a && Math.Abs(DisplaySize - value) > .001 && a.Kind is not Tool.Text)
-            ChangeStyle(x => { if (x.Kind is Tool.Blur or Tool.Mosaic) x.EffectSize = Math.Clamp((int)Math.Round(value * 2), 2, 64); else x.Stroke = Math.Max(1, value / 2); });
+        if (Selection is { Kind: Tool.Blur or Tool.Mosaic } effect)
+        {
+            int pixels = Math.Clamp((int)Math.Round(value * 2), 2, 64);
+            if (effect.EffectSize != pixels) ChangeStyle(x => x.EffectSize = pixels); else Notify();
+        }
+        else if (Selection is { Kind: not Tool.Text } a && Math.Abs(a.Stroke - Math.Max(1, value / 2)) > .001)
+            ChangeStyle(x => x.Stroke = Math.Max(1, value / 2));
         else Notify();
     }
     public void SetTextStyle(string font, double size, bool bold, bool background)
@@ -106,7 +123,7 @@ public sealed class EditorSurface : FrameworkElement
     }
     internal bool BeginPointer(Point point, int clicks = 1)
     {
-        EndStyleEdit(); start = point; cropDrag = Rect.Empty; checkpointed = false; gesture = Gesture.None;
+        EndStyleEdit(); CancelPointer(); start = point;
         if (CurrentTool == Tool.Color)
         {
             var p = Clamp(point); var b = document.Raster(new Rect(Math.Clamp((int)p.X, 0, document.Image.Width - 1), Math.Clamp((int)p.Y, 0, document.Image.Height - 1), 1, 1)); var bytes = new byte[4]; b.CopyPixels(bytes, 4, 0);
@@ -130,11 +147,11 @@ public sealed class EditorSurface : FrameworkElement
             start = Clamp(point);
             if (CurrentTool == Tool.Select) { Notify(); return false; }
             gesture = CurrentTool == Tool.Crop ? Gesture.Crop : CurrentTool == Tool.Text ? Gesture.Text : Gesture.Draw;
-            if (gesture == Gesture.Draw) { document.Checkpoint(); checkpointed = true; active = NewAnnotation(); document.Annotations.Add(active); selected = active; }
+            if (gesture == Gesture.Draw) active = NewAnnotation(CurrentTool);
         }
-        original = active?.Clone(); Notify(); return true;
+        original = gesture == Gesture.Draw ? null : active?.Clone(); Notify(); return true;
     }
-    private Annotation NewAnnotation() => new() { Kind = CurrentTool, Color = Ink, Stroke = Math.Max(1, InkSize / 2), EffectSize = Math.Clamp((int)Math.Round(InkSize * 2), 2, 64), Bounds = new Rect(start, new Size(1, 1)), Points = [start], Font = TextFont, FontSize = TextSize, Bold = TextBold, Background = TextBackground };
+    private Annotation NewAnnotation(Tool tool) => new() { Kind = tool, Color = Ink, Stroke = Math.Max(1, InkSize / 2), EffectSize = Math.Clamp((int)Math.Round(InkSize * 2), 2, 64), Bounds = new Rect(start, new Size(1, 1)), Points = [start], Font = TextFont, FontSize = TextSize, Bold = TextBold, Background = TextBackground };
     private void Move(object sender, MouseEventArgs e)
     {
         var p = Pixel(e);
@@ -143,34 +160,76 @@ public sealed class EditorSurface : FrameworkElement
     }
     internal void UpdatePointer(Point point)
     {
-        if (gesture == Gesture.None || (point - start).Length < .01) return;
-        if (gesture is Gesture.Crop or Gesture.Text) cropDrag = new Rect(start, Clamp(point));
-        else if (active != null)
+        if (gesture == Gesture.None) return;
+        if (gesture is Gesture.Crop or Gesture.Text)
         {
-            if (!checkpointed) { document.Checkpoint(); checkpointed = true; }
-            switch (gesture)
+            var end = Clamp(point);
+            cropDrag = end == start ? Rect.Empty : new Rect(start, end);
+        }
+        else if (gesture == Gesture.Draw && active is { } drawing) UpdateDrawing(drawing, Clamp(point));
+        else if (active is { } a && original is { } before)
+        {
+            var delta = point - start;
+            if (delta.LengthSquared < .0001)
             {
-                case Gesture.Move:
-                    var delta = point - start; var desired = original!.Bounds.Location + delta; active.Translate(desired - active.Bounds.Location); break;
-                case Gesture.Resize: ResizeSelection(active, original!, handle, point); break;
-                case Gesture.Rotate:
-                    var center = new Point(original!.Bounds.X + original.Bounds.Width / 2, original.Bounds.Y + original.Bounds.Height / 2);
-                    var v = start - center; var w = point - center;
-                    active.Rotation = original.Rotation + Vector.AngleBetween(v, w);
-                    if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) active.Rotation = Math.Round(active.Rotation / 15) * 15;
-                    break;
-                case Gesture.Endpoint:
-                    active.Points = original!.Points.Select(original.ToWorld).ToList(); active.Rotation = 0; active.FlipX = active.FlipY = false;
-                    active.Points[handle == 9 ? 0 : active.Points.Count - 1] = point; active.Bounds = new(active.Points[0], active.Points[^1]); break;
-                case Gesture.Draw:
-                    point = Clamp(point);
-                    if (active.Kind is Tool.Pen or Tool.Highlighter) { active.Points.Add(point); var bounds = active.Bounds; bounds.Union(point); active.Bounds = bounds; }
-                    else { active.Bounds = new(start, point); active.Points = [start, point]; }
-                    break;
+                if (pointerBefore != null) RestoreGeometry(a, before);
             }
+            else { pointerBefore ??= document.CaptureState(); UpdateSelectionGesture(a, before, point, delta); }
         }
         InvalidateVisual();
     }
+    private static bool ValidDrawing(Tool tool, Rect bounds, Vector delta) => tool switch
+    {
+        Tool.Mosaic or Tool.Blur => bounds.Width >= 1 && bounds.Height >= 1 && (bounds.Width >= 2 || bounds.Height >= 2),
+        Tool.Line or Tool.Arrow or Tool.Pen or Tool.Highlighter => delta.LengthSquared >= 4,
+        _ => bounds.Width >= 2 || bounds.Height >= 2
+    };
+    private void UpdateDrawing(Annotation a, Point end)
+    {
+        var bounds = new Rect(start, end);
+        if (pointerBefore == null)
+        {
+            if (!ValidDrawing(a.Kind, bounds, end - start)) return;
+            pointerBefore = document.CaptureState(); document.Annotations.Add(a); selected = a;
+        }
+        if (a.Kind is Tool.Pen or Tool.Highlighter)
+        {
+            if (a.Points[^1] != end) a.Points.Add(end);
+            bounds.Union(a.Bounds); a.Bounds = bounds;
+        }
+        else { a.Bounds = bounds; a.Points = [start, end]; }
+    }
+    private void UpdateSelectionGesture(Annotation a, Annotation before, Point point, Vector delta)
+    {
+        switch (gesture)
+        {
+            case Gesture.Move:
+                a.Translate(before.Bounds.Location + delta - a.Bounds.Location);
+                break;
+            case Gesture.Resize:
+                ResizeSelection(a, before, handle, before.ToWorld(Corners(before.Bounds)[handle]) + delta);
+                break;
+            case Gesture.Rotate:
+                var center = new Point(before.Bounds.X + before.Bounds.Width / 2, before.Bounds.Y + before.Bounds.Height / 2);
+                var direction = point - center;
+                if (direction.LengthSquared < .0001) break;
+                a.Rotation = before.Rotation + Vector.AngleBetween(start - center, direction);
+                if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) a.Rotation = Math.Round(a.Rotation / 15) * 15;
+                break;
+            case Gesture.Endpoint:
+                a.Points = before.Points.Select(before.ToWorld).ToList(); a.Rotation = 0; a.FlipX = a.FlipY = false;
+                a.Points[handle == 9 ? 0 : a.Points.Count - 1] += delta; a.Bounds = new(a.Points[0], a.Points[^1]);
+                break;
+        }
+    }
+    private static void RestoreGeometry(Annotation a, Annotation before)
+    {
+        a.Bounds = before.Bounds; a.Points = [.. before.Points]; a.Rotation = before.Rotation; a.FlipX = before.FlipX; a.FlipY = before.FlipY;
+        a.FontSize = before.FontSize; a.TextWidth = before.TextWidth;
+    }
+    private static bool GeometryChanged(Annotation a, Annotation before) =>
+        a.Bounds != before.Bounds || (a.Rotation - before.Rotation) % 360 != 0 || a.FlipX != before.FlipX || a.FlipY != before.FlipY
+        || a.FontSize != before.FontSize || a.TextWidth != before.TextWidth || !a.Points.SequenceEqual(before.Points);
     internal static void ResizeSelection(Annotation a, Annotation before, int index, Point world)
     {
         var p = before.ToLocal(world); var r = before.Bounds;
@@ -190,20 +249,49 @@ public sealed class EditorSurface : FrameworkElement
     }
     private void Up(object sender, MouseButtonEventArgs e)
     {
-        if (!IsMouseCaptured) return; UpdatePointer(Pixel(e)); EndPointer(); ReleaseMouseCapture(); e.Handled = true;
+        if (!IsMouseCaptured) return; UpdatePointer(Pixel(e)); EndPointer(); e.Handled = true;
+    }
+    private void ResetPointer()
+    {
+        gesture = Gesture.None; cropDrag = Rect.Empty; active = original = null; pointerBefore = null;
+        if (IsMouseCaptured) ReleaseMouseCapture();
+    }
+    internal void CancelPointer()
+    {
+        if (gesture == Gesture.None) return;
+        if (pointerBefore != null && active is { } a)
+        {
+            if (gesture == Gesture.Draw) { document.Annotations.Remove(a); selected = null; }
+            else if (original is { } before) RestoreGeometry(a, before);
+        }
+        ResetPointer(); InvalidateVisual();
     }
     internal void EndPointer()
     {
-        var finished = gesture; gesture = Gesture.None;
+        var finished = gesture;
+        if (finished == Gesture.None) return;
         if (finished == Gesture.Crop && !cropDrag.IsEmpty && cropDrag.Width >= 2 && cropDrag.Height >= 2)
-        { document.Checkpoint(); document.Crop = new(Math.Floor(cropDrag.X), Math.Floor(cropDrag.Y), Math.Floor(cropDrag.Width), Math.Floor(cropDrag.Height)); }
+        {
+            var next = new Rect(Math.Floor(cropDrag.X), Math.Floor(cropDrag.Y), Math.Floor(cropDrag.Width), Math.Floor(cropDrag.Height));
+            if (next != document.Crop) { document.Checkpoint(); document.Crop = next; }
+        }
+        if (pointerBefore is { } state && active is { } a)
+        {
+            if (finished == Gesture.Draw)
+            {
+                bool valid = a.Kind is Tool.Pen or Tool.Highlighter || ValidDrawing(a.Kind, a.Bounds, a.Points[^1] - start);
+                if (valid) document.CommitState(state);
+                else { document.Annotations.Remove(a); selected = null; }
+            }
+            else if (original is { } before && GeometryChanged(a, before)) document.CommitState(state);
+        }
         if (finished == Gesture.Text)
         {
-            var a = NewAnnotation(); if (!cropDrag.IsEmpty && cropDrag.Width >= 12) { a.Bounds = cropDrag; a.TextWidth = cropDrag.Width; }
-            cropDrag = Rect.Empty; EditText(a, true);
+            var text = NewAnnotation(Tool.Text); if (!cropDrag.IsEmpty && cropDrag.Width >= 12) { text.Bounds = cropDrag; text.TextWidth = cropDrag.Width; }
+            ResetPointer(); EditText(text, true);
         }
-        if (finished == Gesture.Draw && active != null && active.Bounds.Width < 2 && active.Bounds.Height < 2) { document.Annotations.Remove(active); selected = null; }
-        cropDrag = Rect.Empty; active = original = null; Notify();
+        else ResetPointer();
+        Notify();
     }
     private void EditText(Annotation annotation, bool add)
     {
@@ -215,6 +303,7 @@ public sealed class EditorSurface : FrameworkElement
     }
     public void ApplyText(Annotation annotation, Annotation draft, bool add)
     {
+        EndStyleEdit();
         if (add && string.IsNullOrWhiteSpace(draft.Text)) return;
         bool different = add || annotation.Text != draft.Text || annotation.FontSize != draft.FontSize || annotation.Font != draft.Font || annotation.Color != draft.Color || annotation.Bold != draft.Bold || annotation.Background != draft.Background || annotation.TextWidth != draft.TextWidth;
         if (different)
@@ -229,7 +318,7 @@ public sealed class EditorSurface : FrameworkElement
     {
         dc.DrawRectangle(Brushes.Transparent, null, new Rect(0, 0, ActualWidth, ActualHeight));
         dc.PushTransform(new ScaleTransform(Zoom, Zoom)); dc.PushTransform(new TranslateTransform(-document.Crop.X, -document.Crop.Y));
-        if (DrawBaseImage) document.Draw(dc, Visible); else document.DrawAnnotations(dc, Visible, HiddenAnnotation);
+        if (DrawBaseImage) document.Draw(dc, Visible, InvalidateVisual); else document.DrawAnnotations(dc, Visible, HiddenAnnotation, InvalidateVisual);
         if (Selection is { } a && a != HiddenAnnotation)
         {
             var line = new System.Windows.Media.Pen(Ui.Accent, 1 / Zoom); var dashed = new System.Windows.Media.Pen(Ui.Accent, 1 / Zoom) { DashStyle = DashStyles.Dash };

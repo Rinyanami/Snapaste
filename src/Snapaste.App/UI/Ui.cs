@@ -26,9 +26,23 @@ public static class Ui
         content.Children.Add(Icon(icon)); content.Children.Add(new TextBlock { Text = label, Margin = new Thickness(7, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center }); button.Content = content;
         if (primary) button.SetResourceReference(FrameworkElement.StyleProperty, "PrimaryButton"); return button;
     }
+    public static void ObserveText(ComboBox control, Window owner, Action changed)
+    {
+        // Observe the ComboBox value, not its template TextBox's routed event:
+        // that event can arrive while the value is still being synchronized.
+        var property = System.ComponentModel.DependencyPropertyDescriptor.FromProperty(ComboBox.TextProperty, typeof(ComboBox));
+        EventHandler handler = (_, _) => changed();
+        property.AddValueChanged(control, handler);
+        owner.Closed += (_, _) => property.RemoveValueChanged(control, handler);
+    }
+    public static bool TryFontSize(string text, out double value)
+    {
+        return double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out value)
+            && double.IsFinite(value) && value is >= 8 and <= 300;
+    }
     public static Button Tool(string icon, string label, Action action, string? hint = null)
     {
-        var button = Button(label, action, hint); button.Content = Icon(icon, 18); button.Width = 36; button.Height = 36; button.Padding = new Thickness(8); button.Margin = new Thickness(2);
+        var button = Button(label, action, hint == null || hint.Contains(label, StringComparison.Ordinal) ? hint : label + " · " + hint); button.Content = Icon(icon, 18); button.Width = 36; button.Height = 36; button.Padding = new Thickness(8); button.Margin = new Thickness(2);
         button.SetResourceReference(FrameworkElement.StyleProperty, "QuietButton"); return button;
     }
     public static Border Card(UIElement child, double padding = 18, bool floating = false)
@@ -64,7 +78,7 @@ public static class Ui
         if (value == "System") { using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"); dark = key?.GetValue("AppsUseLightTheme") is int n && n == 0; }
         var colors = dark
             ? new[] { "#24212B", "#2E2A36", "#F3EFF8", "#AAA2B6", "#443D50", "#393242", "#B49BEF", "#453953", "#1D1A23", "#86C5AE", "#E4B47C", "#7960B7" }
-            : new[] { "#F5F3F7", "#FFFFFF", "#302C38", "#787180", "#E5E0EB", "#F0ECF6", "#7762BA", "#EEE8FA", "#E7E4ED", "#3A806D", "#AC6729", "#7762BA" };
+            : new[] { "#F5F3F7", "#FFFFFF", "#302C38", "#68616F", "#E5E0EB", "#F0ECF6", "#7762BA", "#EEE8FA", "#E7E4ED", "#2E725F", "#92531D", "#7762BA" };
         var names = new[] { "SurfaceBrush", "PanelBrush", "TextBrush", "MutedBrush", "BorderBrush", "HoverBrush", "AccentBrush", "AccentSoftBrush", "CanvasBrush", "SuccessBrush", "WarningBrush", "PrimaryBrush" };
         for (int i = 0; i < names.Length; i++) Application.Current.Resources[names[i]] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(colors[i]));
     }
