@@ -74,6 +74,7 @@ public sealed class CaptureOverlay : Window
         annotations = new EditorSurface(Document) { DrawBaseImage = false, Visibility = Visibility.Collapsed, CurrentTool = Tool.Select };
         var toolbarContent = new StackPanel(); toolbarContent.Children.Add(toolbarItems); toolbarContent.Children.Add(options);
         toolbar = Ui.Card(toolbarContent, 5, true); toolbar.Visibility = Visibility.Collapsed;
+        toolbar.SizeChanged += (_, _) => { if (textInput != null && !closed) UpdateTextLayout(); };
         root.Children.Add(surface); root.Children.Add(annotations); root.Children.Add(chrome); root.Children.Add(toolbar); Panel.SetZIndex(toolbar, 5);
         foreach (Tool tool in Enum.GetValues<Tool>())
         {
@@ -161,7 +162,16 @@ public sealed class CaptureOverlay : Window
     private static bool Within(object? source, DependencyObject? ancestor)
     {
         if (ancestor == null) return false;
-        for (var node = source as DependencyObject; node != null; node = node is Visual ? VisualTreeHelper.GetParent(node) : LogicalTreeHelper.GetParent(node)) if (node == ancestor) return true;
+        for (var node = source as DependencyObject; node != null;)
+        {
+            if (node == ancestor) return true;
+            // A ComboBox popup has a separate visual root. Its item still
+            // belongs to the toolbar; choosing a value must not commit text.
+            if (node is ComboBoxItem item && ItemsControl.ItemsControlFromItemContainer(item) is { } owner) node = owner;
+            else node = (node is Visual ? VisualTreeHelper.GetParent(node) : null)
+                ?? LogicalTreeHelper.GetParent(node)
+                ?? (node as FrameworkElement)?.TemplatedParent;
+        }
         return false;
     }
     private void BuildOptions()
@@ -446,6 +456,7 @@ public sealed class CaptureOverlay : Window
         Canvas.SetLeft(toolbar, Math.Clamp(r.Right - size.Width, area.Left + 6, Math.Max(area.Left + 6, area.Right - size.Width - 6)));
         double top = r.Bottom + size.Height + 16 <= area.Bottom ? r.Bottom + 10 : r.Top - size.Height - 10;
         Canvas.SetTop(toolbar, Math.Clamp(top, area.Top + 6, Math.Max(area.Top + 6, area.Bottom - size.Height - 6)));
+        if (textInput != null) UpdateTextLayout();
     }
     private void SelectTool(Tool tool)
     {
@@ -621,35 +632,135 @@ public sealed class CaptureOverlay : Window
     }
     private void UpdateTextLayout()
     {
-        if (textInput == null || textDraft == null) return;
-        textDraft.Text = textInput.Text; textDraft.MeasureText();
+        if (textInput == null || textDraft == null || textOriginal == null) return;
+        textDraft.Text = textInput.Text;
+        // A clicked note can temporarily wrap at the crop edge. Recompute
+        // that width from the text so undo and shortening can restore auto size.
+        textDraft.TextWidth = textOriginal.TextWidth;
+        textDraft.MeasureText();
         double available = Math.Max(1, Document.Crop.Right - textDraft.Bounds.X);
         if (addingText && textDraft.TextWidth == 0 && textDraft.Bounds.Width > available)
         {
             textDraft.TextWidth = available; textDraft.MeasureText();
         }
-        textInput.FontFamily = new FontFamily(textDraft.Font); textInput.FontSize = textDraft.FontSize * annotations.Zoom; textInput.FontWeight = textDraft.Bold ? FontWeights.Bold : FontWeights.Normal;
+        double zoom = annotations.Zoom;
+        if (textInput.FontFamily.Source != textDraft.Font) textInput.FontFamily = new FontFamily(textDraft.Font);
+        textInput.FontSize = textDraft.FontSize * zoom; textInput.FontWeight = textDraft.Bold ? FontWeights.Bold : FontWeights.Normal;
         textInput.FontStyle = textDraft.Italic ? FontStyles.Italic : FontStyles.Normal;
         textInput.TextDecorations = textDraft.Underline ? TextDecorations.Underline : null;
         textInput.TextAlignment = textDraft.Alignment;
-        textInput.Padding = new Thickness(textDraft.TextInset * annotations.Zoom, 0, 0, 0);
-        textInput.TextWrapping = textDraft.TextWidth > 0 ? TextWrapping.Wrap : TextWrapping.NoWrap;
-        textInput.Foreground = new SolidColorBrush(textDraft.Color); textInput.Background = textDraft.Background ? new SolidColorBrush(Color.FromArgb(230, 255, 255, 255)) : Brushes.Transparent;
+        bool wrap = textDraft.TextWidth > 0;
+        textInput.TextWrapping = wrap ? TextWrapping.Wrap : TextWrapping.NoWrap;
+        if (textInput.Foreground is not SolidColorBrush ink || ink.Color != textDraft.Color)
+            textInput.Foreground = new SolidColorBrush(textDraft.Color);
+        var background = textDraft.Background ? Color.FromArgb(230, 255, 255, 255) : Colors.Transparent;
+        if (textInput.Background is not SolidColorBrush fill || fill.Color != background)
+            textInput.Background = new SolidColorBrush(background);
         var origin = Local(new Point(textDraft.Bounds.X + screen.X, textDraft.Bounds.Y + screen.Y));
         // WPF TextBox reserves two more DIPs per side for its caret. Keep its
-        // text content rectangle aligned with the exported annotation.
-        Canvas.SetLeft(textInput, origin.X - 3); Canvas.SetTop(textInput, origin.Y - 1);
-        double width = textDraft.Bounds.Width;
-        if (textDraft.Text.Length == 0 && textDraft.TextWidth == 0) width = Math.Max(width, Math.Min(available, Math.Max(24, textDraft.FontSize)));
-        textInput.Width = Math.Max(1, width * annotations.Zoom) + 6;
-        textInput.Height = Math.Max(1, textDraft.Bounds.Height * annotations.Zoom) + 2;
-        textInput.MaxWidth = double.PositiveInfinity;
-        // Match the annotation's transform while keeping native WPF text services/IME.
-        var matrix = textDraft.Transform; var local = Matrix.Identity;
-        double x = textDraft.Bounds.X - 3 / annotations.Zoom, y = textDraft.Bounds.Y - 1 / annotations.Zoom;
-        local.Translate(x, y); local.Append(matrix); local.Translate(-x, -y);
-        local.OffsetX *= annotations.Zoom; local.OffsetY *= annotations.Zoom;
-        textInput.RenderTransform = new MatrixTransform(local);
+        // text content aligned with the annotation wherever the viewport fits.
+        double inset = textDraft.TextInset * zoom;
+        double glyphWidth = Math.Max(12, textInput.FontSize);
+        double width = Math.Max(1, textDraft.Bounds.Width * zoom);
+        if (textDraft.Text.Length == 0 || wrap && width - inset < glyphWidth)
+            width = Math.Max(width, inset + Math.Max(24, glyphWidth));
+        double lineHeight = Math.Max(1, textInput.FontFamily.LineSpacing * textInput.FontSize);
+        double height = Math.Max(textDraft.Bounds.Height * zoom, lineHeight);
+        // The native caret can occupy a trailing blank line that FormattedText
+        // does not include in the exported height.
+        if (textDraft.Text.Length > 0 && textDraft.Text[^1] is '\r' or '\n' or '\u2028' or '\u2029') height += lineHeight;
+        var preferred = new Size(width + 6, Math.Ceiling(height) + 2);
+
+        // Keep the annotation's orientation. Any translation or scrolling
+        // needed at a screen edge belongs only to the live editor.
+        var local = Matrix.Identity;
+        double x = textDraft.Bounds.X - 3 / zoom, y = textDraft.Bounds.Y - 1 / zoom;
+        local.Translate(x, y); local.Append(textDraft.Transform); local.Translate(-x, -y);
+        local.OffsetX *= zoom; local.OffsetY *= zoom;
+        var transform = new MatrixTransform(local);
+        var anchor = textDraft.ToWorld(textDraft.Bounds.TopLeft) + new Vector(screen.X, screen.Y);
+        var area = MonitorArea(anchor);
+        if (area.IsEmpty || area.Width <= 0 || area.Height <= 0) area = Local(screen);
+        var placement = PlaceTextEditor(preferred, area, transform, new Point(origin.X - 3, origin.Y - 1), glyphWidth + 6, lineHeight * 3 + 2);
+        var viewport = placement.Size;
+        bool clippedWidth = viewport.Width + .001 < preferred.Width;
+        bool clippedHeight = viewport.Height + .001 < preferred.Height;
+        textInput.Width = viewport.Width; textInput.Height = viewport.Height;
+        textInput.Padding = new Thickness(Math.Min(inset, Math.Max(0, viewport.Width - glyphWidth - 6)), 0, 0, 0);
+        // Hidden keeps native caret and wheel scrolling without reducing the
+        // content width by the size of a visible scrollbar.
+        textInput.HorizontalScrollBarVisibility = clippedWidth && !wrap ? ScrollBarVisibility.Hidden : ScrollBarVisibility.Disabled;
+        textInput.VerticalScrollBarVisibility = clippedHeight || clippedWidth && wrap ? ScrollBarVisibility.Hidden : ScrollBarVisibility.Disabled;
+        Canvas.SetLeft(textInput, placement.Position.X);
+        Canvas.SetTop(textInput, placement.Position.Y);
+        if (textInput.RenderTransform is not MatrixTransform current || current.Matrix != local)
+            textInput.RenderTransform = transform;
+    }
+    private readonly record struct TextViewport(Size Size, Point Position, Rect Bounds);
+    private TextViewport PlaceTextEditor(Size desired, Rect area, MatrixTransform transform, Point origin, double minWidth, double minHeight)
+    {
+        var normal = PlaceTextViewport(desired, area, transform, origin, minWidth, minHeight);
+        double left = Canvas.GetLeft(toolbar), top = Canvas.GetTop(toolbar);
+        var size = new Size(Math.Max(toolbar.DesiredSize.Width, toolbar.ActualWidth), Math.Max(toolbar.DesiredSize.Height, toolbar.ActualHeight));
+        if (toolbar.Visibility != Visibility.Visible || !double.IsFinite(left + top) || size.Width <= 0 || size.Height <= 0)
+            return normal;
+        var blocked = new Rect(new Point(left, top), size);
+        blocked.Inflate(4, 4);
+        blocked.Intersect(area);
+        if (blocked.IsEmpty || !normal.Bounds.IntersectsWith(blocked)) return normal;
+
+        // A shifted, scrollable editor can still use its normal orientation
+        // while leaving the whole toolbar accessible. Only move on overlap.
+        Rect[] clear =
+        [
+            new(area.Left, area.Top, area.Width, blocked.Top - area.Top),
+            new(area.Left, blocked.Bottom, area.Width, area.Bottom - blocked.Bottom),
+            new(area.Left, area.Top, blocked.Left - area.Left, area.Height),
+            new(blocked.Right, area.Top, area.Right - blocked.Right, area.Height)
+        ];
+        TextViewport? best = null;
+        (double Readability, bool WidthClipped, double Distance) bestScore = default;
+        double usefulWidth = Math.Min(desired.Width, minWidth), usefulHeight = Math.Min(desired.Height, minHeight);
+        foreach (var free in clear)
+        {
+            if (free.Width < 1 || free.Height < 1) continue;
+            var candidate = PlaceTextViewport(desired, free, transform, origin, minWidth, minHeight);
+            double readability = Math.Min(1, Math.Min(candidate.Size.Width / usefulWidth, candidate.Size.Height / usefulHeight));
+            var score = (-readability, candidate.Size.Width + .001 < desired.Width, (candidate.Position - origin).LengthSquared);
+            if (best == null || score.CompareTo(bestScore) < 0) { best = candidate; bestScore = score; }
+        }
+        return best ?? normal;
+    }
+    private static TextViewport PlaceTextViewport(Size desired, Rect area, MatrixTransform transform, Point origin, double minWidth, double minHeight)
+    {
+        var size = FitTextViewport(desired, area.Size, transform.Matrix, minWidth, minHeight);
+        var bounds = transform.TransformBounds(new Rect(new Point(), size));
+        bounds.Offset(origin.X, origin.Y);
+        var offset = new Vector(
+            Math.Clamp(bounds.Left, area.Left, Math.Max(area.Left, area.Right - bounds.Width)) - bounds.Left,
+            Math.Clamp(bounds.Top, area.Top, Math.Max(area.Top, area.Bottom - bounds.Height)) - bounds.Top);
+        bounds.Offset(offset);
+        return new TextViewport(size, origin + offset, bounds);
+    }
+    private static Size FitTextViewport(Size desired, Size area, Matrix transform, double minWidth, double minHeight)
+    {
+        double wx = Math.Abs(transform.M11), wy = Math.Abs(transform.M12);
+        double hx = Math.Abs(transform.M21), hy = Math.Abs(transform.M22);
+        if (wx * desired.Width + hx * desired.Height <= area.Width && wy * desired.Width + hy * desired.Height <= area.Height)
+            return desired;
+
+        // Account for both axes of rotated text. Hold room for one glyph
+        // and a few lines where possible before fitting the natural width.
+        minWidth = Math.Min(minWidth, desired.Width);
+        minHeight = Math.Min(minHeight, desired.Height);
+        double scale = Math.Min(1, Math.Min(area.Width / (wx * minWidth + hx * minHeight), area.Height / (wy * minWidth + hy * minHeight)));
+        minHeight *= scale;
+        double width = Math.Min(desired.Width, AxisLength(area.Width - hx * minHeight, area.Height - hy * minHeight, wx, wy));
+        double height = Math.Min(desired.Height, AxisLength(area.Width - wx * width, area.Height - wy * width, hx, hy));
+        return new Size(Math.Max(1, width), Math.Max(1, height));
+
+        static double AxisLength(double x, double y, double weightX, double weightY) =>
+            Math.Min(weightX > 1e-8 ? x / weightX : double.PositiveInfinity, weightY > 1e-8 ? y / weightY : double.PositiveInfinity);
     }
     private void RestoreTextFocus()
     {
@@ -677,6 +788,9 @@ public sealed class CaptureOverlay : Window
     private void CommitText()
     {
         if (textInput == null || textOriginal == null || textDraft == null) return;
+        // Let native text services finish focus loss while the editor is still
+        // attached. Removing it first can discard an outstanding IME result.
+        if (textInput.IsKeyboardFocusWithin) Keyboard.Focus(annotations);
         var original = textOriginal; var draft = textDraft; bool add = addingText; draft.Text = textInput.Text;
         RemoveTextInput(); annotations.ApplyText(original, draft, add); Refresh();
     }
