@@ -10,8 +10,18 @@ public sealed class CaptureOverlay : Window
 {
     private readonly BitmapSource desktop;
     private readonly Rect screen;
+    private readonly Rect[] monitors;
     private readonly Settings settings;
-    private readonly WindowDetector detector = new();
+    private readonly WindowDetector detector;
+    private readonly CancellationTokenSource detectionLifetime = new();
+    private PixelRegionDetector? pixelDetector;
+    private Task? pixelPreparation;
+    private sealed record RegionCandidate(Rect Bounds, nint Handle, string Kind);
+    private readonly List<RegionCandidate> candidates = [];
+    private RegionCandidate? preferredCandidate;
+    private int candidateIndex;
+    private nint candidateTarget, pressedTarget, initialTarget;
+    private Rect pressedCandidate = Rect.Empty;
     private readonly OverlaySurface surface;
     private readonly OverlayChrome chrome;
     private readonly EditorSurface annotations;
@@ -32,14 +42,14 @@ public sealed class CaptureOverlay : Window
     private OcrPanel? ocrPanel;
     private Annotation? textOriginal, textDraft;
     private bool addingText, updatingTextOptions, exporting, closed;
-    private Rect selected = Rect.Empty, candidate = Rect.Empty, initial;
-    private Point start, pointer;
-    private bool dragging;
+    private Rect selected = Rect.Empty, candidate = Rect.Empty, renderedSelection = Rect.Empty, initial;
+    private Point start, pointer, pressedPointer;
+    private bool dragging, dragMoved, pointerKnown;
     private EditSnapshot? cropBefore;
     private Rect initialCrop;
     private int handle = -2, detectionMode;
     private nint target;
-    private DateTime lastDetection;
+    private readonly byte[] pixelBytes = new byte[4];
     private readonly bool scrollMode;
     public EditDocument Document { get; }
     // A cancelled save or failed output keeps all work in the overlay.
@@ -48,6 +58,11 @@ public sealed class CaptureOverlay : Window
     public CaptureOverlay(BitmapSource desktop, Rect screen, Settings settings, bool scroll)
     {
         this.desktop = desktop; this.screen = screen; this.settings = settings; scrollMode = scroll;
+        monitors = System.Windows.Forms.Screen.AllScreens.Select(m => Rect.Intersect(new Rect(m.Bounds.X, m.Bounds.Y, m.Bounds.Width, m.Bounds.Height), screen))
+            .Where(r => !r.IsEmpty && r.Width > 0 && r.Height > 0).ToArray();
+        if (monitors.Length == 0) monitors = [screen];
+        detector = new WindowDetector(screen);
+        detector.CandidatesChanged += OnCandidatesChanged;
         Document = new EditDocument(new ImageDocument(desktop));
         detectionMode = settings.UiElements ? 0 : settings.AutoWindow ? 1 : 2;
         Title = "Snapaste · " + Strings.T("Capture"); WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; ShowInTaskbar = false; Topmost = true;
@@ -79,6 +94,13 @@ public sealed class CaptureOverlay : Window
         annotations.EmptySelectionDown += e => { if (e.ClickCount == 2) Finish("Copy"); else BeginDrag(e); e.Handled = true; };
         surface.MouseLeftButtonDown += (_, e) => BeginDrag(e);
         surface.MouseLeftButtonUp += Up; surface.MouseMove += Move;
+        PreviewMouseWheel += (_, e) =>
+        {
+            if (selected.IsEmpty && !dragging && detectionMode < 2)
+            {
+                CycleCandidate(e.Delta > 0 ? -1 : 1); e.Handled = true;
+            }
+        };
         surface.LostMouseCapture += (_, _) => { if (dragging) CancelCropDrag(); };
         PreviewMouseLeftButtonDown += (_, e) =>
         {
@@ -93,7 +115,7 @@ public sealed class CaptureOverlay : Window
         PreviewMouseMove += (_, e) =>
         {
             if (dragging || ocrPanel != null) return;
-            pointer = Physical(e);
+            pointer = Physical(e); pointerKnown = true;
             if (annotations.CurrentTool == Tool.Select) annotations.Cursor = Hit(pointer) switch { 0 or 4 => Cursors.SizeNWSE, 2 or 6 => Cursors.SizeNESW, 1 or 5 => Cursors.SizeNS, 3 or 7 => Cursors.SizeWE, _ => Cursors.Arrow };
             chrome.InvalidateVisual();
         };
@@ -101,14 +123,32 @@ public sealed class CaptureOverlay : Window
         {
             if (exporting || ocrPanel != null) return;
             if (Within(e.OriginalSource, toolbar) || textInput != null) return;
+            if (dragging) { CancelCropDrag(); e.Handled = true; return; }
             if (selected.IsEmpty) Close();
             else if (annotations.CurrentTool != Tool.Select || annotations.HasSelection) { SelectTool(Tool.Select); annotations.ClearSelection(); }
-            else { selected = candidate = Rect.Empty; annotations.Visibility = toolbar.Visibility = Visibility.Collapsed; RefreshVisuals(); }
+            else
+            {
+                selected = candidate = Rect.Empty; target = 0; preferredCandidate = null;
+                pointer = Physical(e); pointerKnown = true; detector.Reset();
+                annotations.Visibility = toolbar.Visibility = Visibility.Collapsed; RefreshCandidates();
+            }
             e.Handled = true;
         };
         SourceInitialized += (_, _) => Native.PlacePhysical(this, screen);
         root.SizeChanged += (_, _) => { surface.Width = chrome.Width = root.ActualWidth; surface.Height = chrome.Height = root.ActualHeight; Refresh(); PositionOcr(); };
-        PreviewKeyDown += Key; Loaded += (_, _) => { Activate(); Focus(); }; Closed += (_, _) => { closed = true; ocrPanel?.Dismiss(); };
+        PreviewKeyDown += Key;
+        Loaded += (_, _) =>
+        {
+            Activate(); Focus(); pointer = PixelPoint(Native.Cursor); pointerKnown = true;
+            RefreshCandidates();
+        };
+        Closed += (_, _) =>
+        {
+            closed = true; ocrPanel?.Dismiss(); detector.CandidatesChanged -= OnCandidatesChanged; detector.Dispose();
+            detectionLifetime.Cancel();
+            if (pixelPreparation == null || pixelPreparation.IsCompleted) detectionLifetime.Dispose();
+            else _ = pixelPreparation.ContinueWith(_ => detectionLifetime.Dispose(), TaskScheduler.Default);
+        };
     }
 
     private static void Compact(Button b) { b.Width = b.Height = b.MinHeight = 32; b.Padding = new Thickness(6); b.Margin = new Thickness(1); }
@@ -148,8 +188,22 @@ public sealed class CaptureOverlay : Window
     }
     private Point Physical(MouseEventArgs e)
     {
-        var p = PointToScreen(e.GetPosition(this));
-        return new(Math.Clamp(Math.Round(p.X), screen.Left, screen.Right - 1), Math.Clamp(Math.Round(p.Y), screen.Top, screen.Bottom - 1));
+        return PixelPoint(PointToScreen(e.GetPosition(this)));
+    }
+    private Point PixelPoint(Point p) => new(Math.Clamp(Math.Floor(p.X), screen.Left, screen.Right - 1), Math.Clamp(Math.Floor(p.Y), screen.Top, screen.Bottom - 1));
+    // Pixel sampling is inclusive; rectangle edges are exclusive. The last
+    // accessible screen pixel must still let a drag reach the outer edge.
+    private Point BoundaryPoint(Point p)
+    {
+        var monitor = PhysicalMonitor(p);
+        bool rightEdge = p.X >= monitor.Right - 1 && !monitors.Any(r => ContainsPixel(r, new Point(monitor.Right, p.Y)));
+        bool bottomEdge = p.Y >= monitor.Bottom - 1 && !monitors.Any(r => ContainsPixel(r, new Point(p.X, monitor.Bottom)));
+        return new(rightEdge ? monitor.Right : p.X, bottomEdge ? monitor.Bottom : p.Y);
+    }
+    private Rect PhysicalMonitor(Point p)
+    {
+        foreach (var monitor in monitors) if (ContainsPixel(monitor, p)) return monitor;
+        return monitors.MinBy(r => (new Point(Math.Clamp(p.X, r.Left, r.Right - 1), Math.Clamp(p.Y, r.Top, r.Bottom - 1)) - p).LengthSquared);
     }
     private Point Local(Point p)
     {
@@ -159,56 +213,150 @@ public sealed class CaptureOverlay : Window
         var dpi = VisualTreeHelper.GetDpi(this); return new((p.X - screen.X) / dpi.DpiScaleX, (p.Y - screen.Y) / dpi.DpiScaleY);
     }
     private Rect Local(Rect r) => new(Local(r.TopLeft), Local(r.BottomRight));
+    private static bool ContainsPixel(Rect r, Point p) => !r.IsEmpty && p.X >= r.Left && p.X < r.Right && p.Y >= r.Top && p.Y < r.Bottom;
+    private Rect PixelBounds(Rect r)
+    {
+        if (r.IsEmpty || !double.IsFinite(r.Left + r.Top + r.Width + r.Height) || r.Width <= 0 || r.Height <= 0) return Rect.Empty;
+        return Rect.Intersect(new Rect(new Point(Math.Floor(r.Left), Math.Floor(r.Top)), new Point(Math.Ceiling(r.Right), Math.Ceiling(r.Bottom))), screen);
+    }
+    private static bool SameBounds(Rect a, Rect b) => !a.IsEmpty && !b.IsEmpty && Math.Abs(a.Left - b.Left) <= 1 && Math.Abs(a.Top - b.Top) <= 1 && Math.Abs(a.Right - b.Right) <= 1 && Math.Abs(a.Bottom - b.Bottom) <= 1;
+    private void OnCandidatesChanged()
+    {
+        if (!closed && selected.IsEmpty && !dragging && detectionMode == 0) RefreshCandidates();
+    }
+    private async Task PreparePixelDetection()
+    {
+        var token = detectionLifetime.Token;
+        try
+        {
+            var result = await PixelRegionDetector.CreateAsync(desktop, screen, token).ConfigureAwait(false);
+            if (token.IsCancellationRequested || Dispatcher.HasShutdownStarted) return;
+            await Dispatcher.InvokeAsync(() =>
+            {
+                if (closed || token.IsCancellationRequested) return;
+                pixelDetector = result;
+                if (selected.IsEmpty && !dragging && detectionMode == 0) RefreshCandidates();
+            });
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception error) { if (!closed) Log.Error("Pixel boundary detection", error); }
+    }
+    private void RefreshCandidates()
+    {
+        if (closed || dragging || !selected.IsEmpty || !pointerKnown) return;
+        candidates.Clear(); candidateIndex = 0; candidate = Rect.Empty; candidateTarget = 0;
+        if (detectionMode == 2) { preferredCandidate = null; RefreshVisuals(); return; }
+        if (detectionMode == 0 && pixelPreparation == null) pixelPreparation = PreparePixelDetection();
+        var detected = detector.Candidates(pointer, detectionMode == 0);
+        var owner = detected.LastOrDefault(value => value.IsWindow);
+        void Add(Rect bounds, nint handle, string kind)
+        {
+            bounds = PixelBounds(bounds);
+            if (!ContainsPixel(bounds, pointer) || bounds.Width < 2 || bounds.Height < 2) return;
+            if (scrollMode && (bounds.Width < 80 || bounds.Height < 100)) return;
+            if (candidates.Any(value => SameBounds(value.Bounds, bounds))) return;
+            candidates.Add(new(bounds, handle, kind));
+        }
+        foreach (var item in detected) Add(item.Bounds, item.Handle, item.IsWindow ? "WindowMode" : "ControlRegion");
+        if (detectionMode == 0 && pixelDetector != null)
+            foreach (var bounds in pixelDetector.FindCandidates(pointer))
+                if (owner.Handle == 0 || owner.Bounds.Contains(bounds)) Add(bounds, owner.Handle, "PixelRegion");
+        if (preferredCandidate is { } preferred && ContainsPixel(preferred.Bounds, pointer) && preferred.Handle == owner.Handle)
+            Add(preferred.Bounds, preferred.Handle, preferred.Kind);
+        else preferredCandidate = null;
+        candidates.Sort((a, b) => (a.Bounds.Width * a.Bounds.Height).CompareTo(b.Bounds.Width * b.Bounds.Height));
+        if (preferredCandidate is { } choice) candidateIndex = Math.Max(0, candidates.FindIndex(item => SameBounds(item.Bounds, choice.Bounds)));
+        if (candidates.Count > 0)
+        {
+            candidate = candidates[candidateIndex].Bounds; candidateTarget = candidates[candidateIndex].Handle;
+        }
+        RefreshVisuals();
+    }
+    private void CycleCandidate(int direction)
+    {
+        if (candidates.Count < 2) return;
+        candidateIndex = Math.Clamp(candidateIndex + direction, 0, candidates.Count - 1);
+        preferredCandidate = candidates[candidateIndex];
+        candidate = preferredCandidate.Bounds; candidateTarget = preferredCandidate.Handle;
+        RefreshVisuals();
+    }
+    private Rect MonitorArea(Point physical)
+    {
+        if (PresentationSource.FromVisual(this) == null) return new Rect(0, 0, root.ActualWidth, root.ActualHeight);
+        return Rect.Intersect(Local(PhysicalMonitor(physical)), new Rect(0, 0, root.ActualWidth, root.ActualHeight));
+    }
     private static Point[] Handles(Rect r) => [r.TopLeft, new(r.Left + r.Width / 2, r.Top), r.TopRight, new(r.Right, r.Top + r.Height / 2), r.BottomRight, new(r.Left + r.Width / 2, r.Bottom), r.BottomLeft, new(r.Left, r.Top + r.Height / 2)];
     private int Hit(Point p)
     {
         if (selected.IsEmpty) return -2;
-        var points = Handles(selected); for (int i = 0; i < points.Length; i++) if ((points[i] - p).Length < 9 * VisualTreeHelper.GetDpi(this).DpiScaleX) return i;
+        var points = Handles(selected); int nearest = -1;
+        double distance = Math.Pow(9 * VisualTreeHelper.GetDpi(this).DpiScaleX, 2);
+        for (int i = 0; i < points.Length; i++)
+        {
+            double next = (points[i] - p).LengthSquared;
+            if (next < distance) { nearest = i; distance = next; }
+        }
+        if (nearest >= 0) return nearest;
         return selected.Contains(p) ? -1 : -2;
     }
     private void BeginDrag(MouseButtonEventArgs e)
     {
         if (exporting || ocrPanel != null) return;
-        CommitText(); start = pointer = Physical(e); initial = selected; initialCrop = Document.Crop; handle = Hit(start);
+        CommitText(); pressedPointer = pointer = Physical(e); pointerKnown = true;
+        start = BoundaryPoint(pointer); initial = selected; initialTarget = target; initialCrop = Document.Crop; handle = Hit(pointer);
+        // Confirm the candidate visible at mouse-down, even if recognition finishes during the click.
+        pressedCandidate = selected.IsEmpty && ContainsPixel(candidate, pointer) ? candidate : Rect.Empty;
+        pressedTarget = pressedCandidate.IsEmpty ? 0 : candidateTarget;
         if (handle == -2) { target = 0; annotations.ClearSelection(); }
         cropBefore = null;
-        dragging = true; surface.CaptureMouse(); toolbar.Visibility = Visibility.Collapsed; annotations.IsHitTestVisible = false;
+        dragMoved = false; dragging = true;
+        if (!surface.CaptureMouse()) { CancelCropDrag(); return; }
+        toolbar.Visibility = Visibility.Collapsed; annotations.IsHitTestVisible = false;
     }
     private void Move(object sender, MouseEventArgs e)
     {
-        pointer = Physical(e);
-        if (dragging)
-        {
-            var delta = pointer - start;
-            if (handle == -2) selected = Normalize(start, pointer);
-            else if (handle == -1) { selected = initial; selected.Offset(delta); selected = Clamp(selected); }
-            else
-            {
-                double l = initial.Left, t = initial.Top, r = initial.Right, b = initial.Bottom;
-                if (handle is 0 or 6 or 7) l += delta.X; if (handle is 0 or 1 or 2) t += delta.Y;
-                if (handle is 2 or 3 or 4) r += delta.X; if (handle is 4 or 5 or 6) b += delta.Y;
-                selected = Normalize(new(l, t), new(r, b));
-            }
-            CheckpointCropChange(); UpdateCrop(); PlaceAnnotations();
-        }
-        else if (selected.IsEmpty && detectionMode < 2 && (DateTime.UtcNow - lastDetection).TotalMilliseconds > 70)
-        {
-            lastDetection = DateTime.UtcNow; (candidate, target) = detector.Find(pointer, detectionMode == 0); candidate.Intersect(screen);
-        }
+        pointer = Physical(e); pointerKnown = true;
+        if (dragging) UpdateDrag(pointer);
+        else if (selected.IsEmpty) RefreshCandidates();
         surface.Cursor = Hit(pointer) switch { -1 => Cursors.SizeAll, 0 or 4 => Cursors.SizeNWSE, 2 or 6 => Cursors.SizeNESW, 1 or 5 => Cursors.SizeNS, 3 or 7 => Cursors.SizeWE, _ => Cursors.Cross };
         RefreshVisuals();
+    }
+    private void UpdateDrag(Point current)
+    {
+        var dpi = VisualTreeHelper.GetDpi(this);
+        if (!dragMoved)
+        {
+            var movement = current - pressedPointer;
+            dragMoved = Math.Abs(movement.X) >= SystemParameters.MinimumHorizontalDragDistance * dpi.DpiScaleX ||
+                        Math.Abs(movement.Y) >= SystemParameters.MinimumVerticalDragDistance * dpi.DpiScaleY;
+        }
+        if (handle == -2 && !dragMoved) return;
+        var end = BoundaryPoint(current); var delta = end - start;
+        if (handle == -2) selected = Normalize(start, end);
+        else if (handle == -1) { selected = initial; selected.Offset(current - pressedPointer); selected = Clamp(selected); }
+        else
+        {
+            double l = initial.Left, t = initial.Top, r = initial.Right, b = initial.Bottom;
+            if (handle is 0 or 6 or 7) l += delta.X; if (handle is 0 or 1 or 2) t += delta.Y;
+            if (handle is 2 or 3 or 4) r += delta.X; if (handle is 4 or 5 or 6) b += delta.Y;
+            selected = Normalize(new(l, t), new(r, b));
+        }
+        target = selected == initial ? initialTarget : 0;
+        CheckpointCropChange(); UpdateCrop(); PlaceAnnotations();
     }
     private Rect Normalize(Point p, Point q) => Rect.Intersect(new Rect(new Point(Math.Min(p.X, q.X), Math.Min(p.Y, q.Y)), new Point(Math.Max(p.X, q.X), Math.Max(p.Y, q.Y))), screen);
     private Rect Clamp(Rect r) => new(Math.Clamp(r.X, screen.Left, screen.Right - r.Width), Math.Clamp(r.Y, screen.Top, screen.Bottom - r.Height), r.Width, r.Height);
     private void Up(object sender, MouseButtonEventArgs e)
     {
         if (!dragging) return;
+        pointer = Physical(e); pointerKnown = true; UpdateDrag(pointer);
         dragging = false; surface.ReleaseMouseCapture(); annotations.IsHitTestVisible = true;
-        if ((pointer - start).Length < 4 && handle == -2) selected = candidate;
+        if (!dragMoved && handle == -2 && ContainsPixel(pressedCandidate, pointer)) { selected = pressedCandidate; target = pressedTarget; }
+        else if (!dragMoved && handle == -2) { selected = initial; target = initialTarget; }
         if (selected.IsEmpty || selected.Width < 2 || selected.Height < 2)
         {
-            selected = initial; Document.Crop = initialCrop; cropBefore = null;
-            if (selected.IsEmpty) { annotations.Visibility = toolbar.Visibility = Visibility.Collapsed; RefreshVisuals(); } else Refresh();
+            selected = initial; target = initialTarget; Document.Crop = initialCrop; cropBefore = null;
+            if (selected.IsEmpty) { annotations.Visibility = toolbar.Visibility = Visibility.Collapsed; RefreshCandidates(); } else Refresh();
             return;
         }
         CheckpointCropChange(); UpdateCrop();
@@ -227,7 +375,8 @@ public sealed class CaptureOverlay : Window
     {
         if (!dragging) return;
         dragging = false; surface.ReleaseMouseCapture(); annotations.IsHitTestVisible = true;
-        selected = initial; Document.Crop = initialCrop; cropBefore = null; Refresh();
+        selected = initial; target = initialTarget; Document.Crop = initialCrop; cropBefore = null;
+        if (selected.IsEmpty) RefreshCandidates(); else Refresh();
     }
     private void UpdateCrop()
     {
@@ -244,22 +393,33 @@ public sealed class CaptureOverlay : Window
         annotations.Visible = Document.Crop; annotations.Visibility = Visibility.Visible;
         Canvas.SetLeft(annotations, r.Left); Canvas.SetTop(annotations, r.Top); annotations.InvalidateVisual();
     }
-    private void RefreshVisuals() { surface.InvalidateVisual(); chrome.InvalidateVisual(); }
+    private void RefreshVisuals()
+    {
+        var next = selected.IsEmpty ? candidate : selected;
+        if (next != renderedSelection) { renderedSelection = next; surface.InvalidateVisual(); }
+        chrome.InvalidateVisual();
+    }
     private void Refresh()
     {
         if (closed) return;
-        if (!selected.IsEmpty) selected = new(Document.Crop.X + screen.X, Document.Crop.Y + screen.Y, Document.Crop.Width, Document.Crop.Height);
+        if (!selected.IsEmpty)
+        {
+            var next = new Rect(Document.Crop.X + screen.X, Document.Crop.Y + screen.Y, Document.Crop.Width, Document.Crop.Height);
+            if (next != selected) target = 0;
+            selected = next;
+        }
         PlaceAnnotations(); RefreshVisuals(); UpdateOptions(); if (!dragging) PositionToolbar();
     }
     private void PositionToolbar()
     {
         if (selected.IsEmpty || ocrPanel != null) return;
-        double width = root.ActualWidth, height = root.ActualHeight;
+        var area = MonitorArea(PixelPoint(selected.BottomRight - new Vector(1, 1)));
+        double width = area.Width;
         toolbar.Visibility = Visibility.Visible; toolbarItems.MaxWidth = options.MaxWidth = Math.Max(150, Math.Min(1024, width - 24));
-        toolbar.Measure(new Size(Math.Max(150, width - 12), Math.Max(200, height))); var size = toolbar.DesiredSize; var r = Local(selected);
-        Canvas.SetLeft(toolbar, Math.Clamp(r.Right - size.Width, 6, Math.Max(6, width - size.Width - 6)));
-        double top = r.Bottom + size.Height + 16 <= height ? r.Bottom + 10 : r.Top - size.Height - 10;
-        Canvas.SetTop(toolbar, Math.Clamp(top, 6, Math.Max(6, height - size.Height - 6)));
+        toolbar.Measure(new Size(Math.Max(150, width - 12), Math.Max(200, area.Height))); var size = toolbar.DesiredSize; var r = Local(selected);
+        Canvas.SetLeft(toolbar, Math.Clamp(r.Right - size.Width, area.Left + 6, Math.Max(area.Left + 6, area.Right - size.Width - 6)));
+        double top = r.Bottom + size.Height + 16 <= area.Bottom ? r.Bottom + 10 : r.Top - size.Height - 10;
+        Canvas.SetTop(toolbar, Math.Clamp(top, area.Top + 6, Math.Max(area.Top + 6, area.Bottom - size.Height - 6)));
     }
     private void SelectTool(Tool tool)
     {
@@ -344,7 +504,15 @@ public sealed class CaptureOverlay : Window
         }
         if (e.OriginalSource is TextBox || Within(e.OriginalSource, font) || Within(e.OriginalSource, fontSize)) return;
         if (e.Key == System.Windows.Input.Key.Escape) { Close(); e.Handled = true; return; }
-        if (selected.IsEmpty && e.Key == System.Windows.Input.Key.Tab) { detectionMode = (detectionMode + 1) % 3; candidate = Rect.Empty; e.Handled = true; RefreshVisuals(); return; }
+        if (selected.IsEmpty && !dragging && e.Key == System.Windows.Input.Key.Tab)
+        {
+            detectionMode = (detectionMode + (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) ? 2 : 1)) % 3;
+            preferredCandidate = null; detector.Reset(); RefreshCandidates(); e.Handled = true; return;
+        }
+        if (selected.IsEmpty && !dragging && e.Key is System.Windows.Input.Key.PageUp or System.Windows.Input.Key.PageDown)
+        {
+            CycleCandidate(e.Key == System.Windows.Input.Key.PageUp ? -1 : 1); e.Handled = true; return;
+        }
         if (e.Key == System.Windows.Input.Key.C && Keyboard.Modifiers == ModifierKeys.None) { try { var c = PixelColor(pointer); Clipboard.SetText($"#{c.R:X2}{c.G:X2}{c.B:X2}"); } catch (Exception ex) { Ui.Error(ex, this); } e.Handled = true; return; }
         if (selected.IsEmpty) return;
         bool control = Keyboard.Modifiers.HasFlag(ModifierKeys.Control);
@@ -365,7 +533,7 @@ public sealed class CaptureOverlay : Window
                 if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) next = Rect.Intersect(new Rect(next.X, next.Y, Math.Max(2, next.Width + dx), Math.Max(2, next.Height + dy)), screen);
                 else { next.Offset(dx, dy); next = Clamp(next); }
                 if (next == selected) { e.Handled = true; return; }
-                Document.Checkpoint(); selected = next;
+                Document.Checkpoint(); selected = next; target = 0;
                 UpdateCrop(); Refresh();
             }
             e.Handled = true;
@@ -425,11 +593,11 @@ public sealed class CaptureOverlay : Window
     }
     private Color PixelColor(Point p)
     {
-        var bytes = new byte[4]; desktop.CopyPixels(new Int32Rect(Math.Clamp((int)(p.X - screen.X), 0, desktop.PixelWidth - 1), Math.Clamp((int)(p.Y - screen.Y), 0, desktop.PixelHeight - 1), 1, 1), bytes, 4, 0); return Color.FromRgb(bytes[2], bytes[1], bytes[0]);
+        desktop.CopyPixels(new Int32Rect(Math.Clamp((int)(p.X - screen.X), 0, desktop.PixelWidth - 1), Math.Clamp((int)(p.Y - screen.Y), 0, desktop.PixelHeight - 1), 1, 1), pixelBytes, 4, 0); return Color.FromRgb(pixelBytes[2], pixelBytes[1], pixelBytes[0]);
     }
     private async void Finish(string action)
     {
-        if (exporting || selected.IsEmpty || selected.Width < 1 || selected.Height < 1 || Accepted == null) return;
+        if (exporting || dragging || selected.IsEmpty || selected.Width < 1 || selected.Height < 1 || Accepted == null) return;
         CommitText();
         if (action == "Scroll")
         {
@@ -448,7 +616,7 @@ public sealed class CaptureOverlay : Window
     {
         protected override void OnRender(DrawingContext dc)
         {
-            dc.DrawImage(o.desktop, new Rect(0, 0, ActualWidth, ActualHeight));
+            dc.DrawImage(o.desktop, o.Local(o.screen));
             var selection = o.selected.IsEmpty ? o.candidate : o.selected;
             var full = new RectangleGeometry(new Rect(0, 0, ActualWidth, ActualHeight));
             Geometry shade = selection.IsEmpty ? full : Geometry.Combine(full, new RectangleGeometry(o.Local(selection)), GeometryCombineMode.Exclude, null);
@@ -457,35 +625,118 @@ public sealed class CaptureOverlay : Window
     }
     private sealed class OverlayChrome(CaptureOverlay o) : FrameworkElement
     {
+        private static readonly Brush PanelFill = new SolidColorBrush(Color.FromRgb(25, 29, 36));
+        private static readonly Brush GridBrush = new SolidColorBrush(Color.FromArgb(85, 110, 122, 140));
+        private static readonly Brush FrameContrast = new SolidColorBrush(Color.FromArgb(170, 15, 19, 27));
+        private Int32Rect cachedPixels;
+        private BitmapSource? cachedImage;
         protected override void OnRender(DrawingContext dc)
         {
             var selection = o.selected.IsEmpty ? o.candidate : o.selected;
             if (!selection.IsEmpty)
             {
-                var r = o.Local(selection); dc.DrawRectangle(null, new System.Windows.Media.Pen(Ui.Accent, 1), r);
-                if (!o.selected.IsEmpty) foreach (var p in Handles(r)) dc.DrawRectangle(Brushes.White, new System.Windows.Media.Pen(Ui.Accent, 1), new Rect(p.X - 3, p.Y - 3, 6, 6));
-                Label(dc, $"{selection.Width:0} × {selection.Height:0}", new Point(r.Left, Math.Max(2, r.Top - 25)), 12);
+                var r = o.Local(selection);
+                double thickness = o.selected.IsEmpty ? 1.5 : 2;
+                dc.DrawRectangle(null, new System.Windows.Media.Pen(FrameContrast, thickness + 1.5), r);
+                dc.DrawRectangle(null, new System.Windows.Media.Pen(Ui.Accent, thickness), r);
+                if (!o.selected.IsEmpty)
+                    foreach (var p in Handles(r)) dc.DrawRectangle(Brushes.White, new System.Windows.Media.Pen(Ui.Accent, 1.5), new Rect(p.X - 3.5, p.Y - 3.5, 7, 7));
+                var badgeArea = o.MonitorArea(o.PixelPoint(selection.TopLeft));
+                string size = string.Format(CultureInfo.CurrentCulture, Strings.T("PixelDimensions"), selection.Width, selection.Height);
+                Label(dc, size, new Point(r.Left, r.Top - 31), 14, badgeArea, true);
+                if (o.selected.IsEmpty && o.candidates.Count > 0)
+                {
+                    string detail = o.candidates.Count > 1 ? string.Format(CultureInfo.CurrentCulture, Strings.T("CandidateDetails"), Strings.T(o.candidates[o.candidateIndex].Kind), o.candidateIndex + 1, o.candidates.Count) : Strings.T(o.candidates[0].Kind);
+                    Label(dc, detail, new Point(r.Left, r.Bottom + 8), 11, badgeArea);
+                }
             }
-            if (o.selected.IsEmpty) Label(dc, Strings.T(o.scrollMode ? "ScrollSelectHint" : "CaptureSelectHint") + "  ·  " + Strings.T(new[] { "ElementMode", "WindowMode", "FreeMode" }[o.detectionMode]), new Point(22, 20), 12);
-            bool inspecting = o.selected.IsEmpty || o.dragging || o.annotations.CurrentTool == Tool.Color;
-            if (o.settings.Magnifier && inspecting && o.IsMouseOver && !Within(Mouse.DirectlyOver, o.toolbar) && !o.pointer.Equals(default(Point)))
+            if (o.selected.IsEmpty)
             {
-                var p = o.Local(o.pointer); var color = o.PixelColor(o.pointer); double x = p.X + 28, y = p.Y + 28;
-                if (x + 184 > ActualWidth) x = p.X - 204; if (y + 160 > ActualHeight) y = p.Y - 180;
-                x = Math.Max(0, x); y = Math.Max(0, y);
-                dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromRgb(25, 29, 36)), null, new Rect(x, y, 184, 160), 8, 8);
-                int width = Math.Min(19, o.desktop.PixelWidth), height = Math.Min(19, o.desktop.PixelHeight);
-                int px = Math.Clamp((int)(o.pointer.X - o.screen.X) - width / 2, 0, o.desktop.PixelWidth - width), py = Math.Clamp((int)(o.pointer.Y - o.screen.Y) - height / 2, 0, o.desktop.PixelHeight - height);
-                RenderOptions.SetBitmapScalingMode(this, BitmapScalingMode.NearestNeighbor);
-                dc.DrawImage(new CroppedBitmap(o.desktop, new Int32Rect(px, py, width, height)), new Rect(x + 44, y + 8, 95, 95));
-                dc.DrawRectangle(null, new System.Windows.Media.Pen(Brushes.Red, 1), new Rect(x + 44 + ((int)(o.pointer.X - o.screen.X) - px) * 95d / width, y + 8 + ((int)(o.pointer.Y - o.screen.Y) - py) * 95d / height, 95d / width, 95d / height));
-                Label(dc, $"X {o.pointer.X:0}  Y {o.pointer.Y:0}\nRGB {color.R}, {color.G}, {color.B}  #{color.R:X2}{color.G:X2}{color.B:X2}", new Point(x + 7, y + 108), 11);
+                var area = o.MonitorArea(o.pointer);
+                double top = !selection.IsEmpty && o.Local(selection).Top < area.Top + 64 ? area.Top + 64 : area.Top + 20;
+                string hintKey = o.detectionMode == 2 ? "FreeSelectHint" : o.scrollMode ? "ScrollSelectHint" : "CaptureSelectHint";
+                Label(dc, Strings.T(hintKey) + "  ·  " + Strings.T(new[] { "ElementMode", "WindowMode", "FreeMode" }[o.detectionMode]), new Point(area.Left + 22, top), 12, area);
             }
+            bool inspecting = o.selected.IsEmpty || o.dragging || o.annotations.CurrentTool == Tool.Color || o.annotations.CurrentTool == Tool.Select && o.Hit(o.pointer) >= 0;
+            if (o.settings.Magnifier && inspecting && o.pointerKnown && (o.IsMouseOver || o.selected.IsEmpty) &&
+                !o.exporting && o.ocrPanel == null && o.textInput == null && !Within(Mouse.DirectlyOver, o.toolbar)) DrawMagnifier(dc, selection);
         }
-        private void Label(DrawingContext dc, string value, Point point, double size)
+        private void DrawMagnifier(DrawingContext dc, Rect selection)
         {
-            var t = new FormattedText(value, CultureInfo.CurrentCulture, FlowDirection.LeftToRight, new Typeface("Microsoft YaHei UI"), size, Brushes.White, VisualTreeHelper.GetDpi(this).PixelsPerDip);
-            dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(220, 22, 27, 34)), null, new Rect(point.X - 4, point.Y - 2, t.Width + 8, t.Height + 4), 4, 4); dc.DrawText(t, point);
+            const int count = 17, cell = 8, side = count * cell;
+            const double panelWidth = 208, panelHeight = 242;
+            var pointer = o.Local(o.pointer); var area = o.MonitorArea(o.pointer);
+            if (area.Width < panelWidth + 12 || area.Height < panelHeight + 12) return;
+            var box = PlaceMagnifier(pointer, area, selection.IsEmpty ? Rect.Empty : o.Local(selection), panelWidth, panelHeight);
+            dc.DrawRoundedRectangle(PanelFill, new System.Windows.Media.Pen(new SolidColorBrush(Color.FromArgb(110, 255, 255, 255)), 1), box, 9, 9);
+            Text(dc, Strings.T("PixelMagnifier"), new Point(box.X + 12, box.Y + 10), 12);
+            var grid = new Rect(box.X + (panelWidth - side) / 2, box.Y + 34, side, side);
+            dc.DrawRectangle(new SolidColorBrush(Color.FromRgb(49, 54, 64)), null, grid);
+            int centerX = Math.Clamp((int)(o.pointer.X - o.screen.X), 0, o.desktop.PixelWidth - 1);
+            int centerY = Math.Clamp((int)(o.pointer.Y - o.screen.Y), 0, o.desktop.PixelHeight - 1);
+            int originX = centerX - count / 2, originY = centerY - count / 2;
+            int left = Math.Max(0, originX), top = Math.Max(0, originY);
+            var pixels = new Int32Rect(left, top, Math.Min(o.desktop.PixelWidth, originX + count) - left, Math.Min(o.desktop.PixelHeight, originY + count) - top);
+            if (cachedImage == null || cachedPixels != pixels)
+            {
+                cachedPixels = pixels; cachedImage = new CroppedBitmap(o.desktop, pixels); cachedImage.Freeze();
+            }
+            RenderOptions.SetBitmapScalingMode(this, BitmapScalingMode.NearestNeighbor);
+            dc.DrawImage(cachedImage, new Rect(grid.X + (left - originX) * cell, grid.Y + (top - originY) * cell, pixels.Width * cell, pixels.Height * cell));
+            var gridPen = new System.Windows.Media.Pen(GridBrush, 1 / VisualTreeHelper.GetDpi(this).DpiScaleX);
+            for (int i = 0; i <= count; i++)
+            {
+                dc.DrawLine(gridPen, new Point(grid.X + i * cell, grid.Top), new Point(grid.X + i * cell, grid.Bottom));
+                dc.DrawLine(gridPen, new Point(grid.Left, grid.Y + i * cell), new Point(grid.Right, grid.Y + i * cell));
+            }
+            if (!selection.IsEmpty)
+            {
+                dc.PushClip(new RectangleGeometry(grid));
+                dc.DrawRectangle(null, new System.Windows.Media.Pen(Ui.Accent, 2), new Rect(grid.X + (selection.Left - o.screen.X - originX) * cell, grid.Y + (selection.Top - o.screen.Y - originY) * cell, selection.Width * cell, selection.Height * cell));
+                dc.Pop();
+            }
+            var center = new Rect(grid.X + count / 2 * cell, grid.Y + count / 2 * cell, cell, cell);
+            dc.DrawRectangle(null, new System.Windows.Media.Pen(Brushes.White, 3), center);
+            dc.DrawRectangle(null, new System.Windows.Media.Pen(Brushes.Crimson, 1.5), center);
+            var color = o.PixelColor(o.pointer);
+            Text(dc, $"X {o.pointer.X:0}  Y {o.pointer.Y:0} px", new Point(box.X + 12, box.Y + 180), 12, true);
+            dc.DrawRectangle(new SolidColorBrush(color), new System.Windows.Media.Pen(Brushes.White, .7), new Rect(box.X + 12, box.Y + 202, 12, 12));
+            Text(dc, $"#{color.R:X2}{color.G:X2}{color.B:X2}  RGB {color.R},{color.G},{color.B}", new Point(box.X + 30, box.Y + 200), 10.5, true);
+            Text(dc, Strings.T("PixelMagnifierHint"), new Point(box.X + 12, box.Y + 221), 10);
+        }
+        private static Rect PlaceMagnifier(Point p, Rect area, Rect selection, double width, double height)
+        {
+            List<Point> positions = [new(p.X + 28, p.Y + 28), new(p.X - width - 28, p.Y + 28), new(p.X + 28, p.Y - height - 28), new(p.X - width - 28, p.Y - height - 28)];
+            var avoid = selection;
+            if (!selection.IsEmpty)
+            {
+                // Include the size and candidate badges around small controls.
+                avoid = new Rect(selection.Left, selection.Top - 34, selection.Width, selection.Height + 72);
+                if (selection.Bottom - p.Y < 110) positions.Add(new(p.X + 28, selection.Bottom + 40));
+                if (selection.Right - p.X < 110) positions.Add(new(selection.Right + 16, p.Y + 28));
+            }
+            Rect best = Rect.Empty; double score = double.PositiveInfinity;
+            foreach (var point in positions)
+            {
+                var bounds = new Rect(Math.Clamp(point.X, area.Left + 6, area.Right - width - 6), Math.Clamp(point.Y, area.Top + 6, area.Bottom - height - 6), width, height);
+                var overlap = Rect.Intersect(bounds, avoid);
+                double value = (overlap.IsEmpty ? 0 : overlap.Width * overlap.Height) + (bounds.TopLeft - point).LengthSquared;
+                if (value < score) { best = bounds; score = value; }
+            }
+            return best;
+        }
+        private FormattedText Format(string value, double size, bool pixel = false)
+            => new(value, CultureInfo.CurrentCulture, FlowDirection.LeftToRight, new Typeface(pixel ? "Consolas" : "Microsoft YaHei UI"), size, Brushes.White, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+        private void Text(DrawingContext dc, string value, Point point, double size, bool pixel = false) => dc.DrawText(Format(value, size, pixel), point);
+        private void Label(DrawingContext dc, string value, Point point, double size, Rect area, bool pixel = false)
+        {
+            if (area.IsEmpty || area.Width < 24 || area.Height < 24) return;
+            var text = Format(value, size, pixel); text.MaxTextWidth = Math.Max(1, area.Width - 24); text.Trimming = TextTrimming.CharacterEllipsis;
+            double width = text.Width + 14, height = text.Height + 8;
+            point.X = Math.Clamp(point.X, area.Left + 6, Math.Max(area.Left + 6, area.Right - width - 6));
+            point.Y = Math.Clamp(point.Y, area.Top + 6, Math.Max(area.Top + 6, area.Bottom - height - 6));
+            dc.DrawRoundedRectangle(PanelFill, new System.Windows.Media.Pen(new SolidColorBrush(Color.FromArgb(90, 255, 255, 255)), 1), new Rect(point, new Size(width, height)), 5, 5);
+            dc.DrawText(text, point + new Vector(7, 4));
         }
     }
 }

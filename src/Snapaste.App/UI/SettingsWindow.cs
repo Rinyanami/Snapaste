@@ -142,9 +142,9 @@ public sealed class SettingsWindow : Window
         ];
         var capture = Page("NormalCapture");
         var detect = Group(capture, "选区辅助");
-        Check(detect, "识别窗口", "鼠标移动时高亮候选窗口", draft.AutoWindow, v => draft.AutoWindow = v);
-        Check(detect, "识别界面元素", "用 Tab 在控件、窗口和自由选区间切换", draft.UiElements, v => draft.UiElements = v);
-        Check(detect, "放大镜", "查看像素、坐标和颜色；按 C 复制颜色", draft.Magnifier, v => draft.Magnifier = v);
+        Check(detect, "默认窗口识别", "关闭智能识别后默认使用窗口模式；两项都关闭时自由框选", draft.AutoWindow, v => draft.AutoWindow = v);
+        Check(detect, "智能识别界面区域", "识别控件和清晰边界；滚轮切换大小，Tab 切换智能/窗口/自由", draft.UiElements, v => draft.UiElements = v);
+        Check(detect, "像素网格放大镜", "每格对应一个截图像素，放大选区边缘；按 C 复制当前颜色", draft.Magnifier, v => draft.Magnifier = v);
         var output = Group(capture, "截图内容与输出");
         Check(output, "包含鼠标指针", "将捕获时的鼠标指针保留在图片中", draft.IncludeCursor, v => draft.IncludeCursor = v);
         Choice(output, "默认图片格式", "PNG 保留清晰文字，JPEG 适合照片", ["PNG", "JPEG", "BMP"], ["PNG", "JPEG", "BMP"], draft.DefaultFormat, v => draft.DefaultFormat = v);

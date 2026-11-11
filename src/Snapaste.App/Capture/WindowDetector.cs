@@ -1,101 +1,345 @@
-using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Windows.Automation;
+using System.Windows.Threading;
 using Snapaste.Core;
 using Snapaste.Platform;
 namespace Snapaste.Capture;
 
-public sealed class WindowDetector
+public readonly record struct DetectionCandidate(Rect Bounds, nint Handle, bool IsWindow);
+
+public sealed class WindowDetector : IDisposable
 {
-    private sealed record Query(WindowDetector Detector, nint Target, Point Point);
-    private sealed record ElementResult(nint Target, Point Point, Rect Bounds);
-    private static readonly Lazy<BlockingCollection<Query>> Requests = new(StartWorker);
-    private static int busy;
-    private ElementResult? element;
+    private static readonly Lazy<AutomationWorker> Worker = new(() => new());
+    private readonly Dispatcher dispatcher = Dispatcher.CurrentDispatcher;
+    private readonly WindowSnapshot[] windows;
+    private Query? request;
+    private WindowSnapshot? resolvedWindow;
+    private DetectionCandidate[]? resolved;
+    private Point resolvedPixel;
+    private bool disposed;
+
+    public WindowDetector() : this(Native.Desktop) { }
+
+    public WindowDetector(Rect screen) => windows = CaptureWindows(screen);
+
+    // The callback is posted to the dispatcher that created this detector.
+    public event Action? CandidatesChanged;
 
     public (Rect Bounds, nint Handle) Find(Point p, bool elements)
     {
-        nint target = 0;
-        Rect found = Rect.Empty;
-        Native.EnumWindows((h, _) =>
-        {
-            if (!Native.IsWindowVisible(h) || Native.IsIconic(h)) return true;
-            Native.GetWindowThreadProcessId(h, out var pid);
-            if (pid == Environment.ProcessId) return true;
-            Native.DwmGetWindowAttribute(h, 14, out int cloaked, 4);
-            if (cloaked != 0) return true;
-            var r = Native.Bounds(h);
-            if (r.Width < 2 || r.Height < 2 || !r.Contains(p)) return true;
-            var name = new System.Text.StringBuilder(128);
-            Native.GetClassName(h, name, name.Capacity);
-            if (name.ToString() is "Progman" or "WorkerW") return true;
-            target = h;
-            found = r;
-            return false;
-        }, 0);
-
-        if (!elements || target == 0) return (found, target);
-        var previous = Volatile.Read(ref element);
-        if ((previous == null || previous.Target != target || (p - previous.Point).LengthSquared > 16) &&
-            Interlocked.CompareExchange(ref busy, 1, 0) == 0)
-        {
-            try { Requests.Value.Add(new(this, target, p)); }
-            catch (Exception e) when (e is InvalidOperationException or ThreadStateException)
-            {
-                Volatile.Write(ref busy, 0);
-                Log.Error("UI Automation worker", e);
-            }
-        }
-        return previous != null && previous.Target == target && previous.Bounds.Contains(p) && found.Contains(previous.Bounds)
-            ? (previous.Bounds, target) : (found, target);
+        var candidates = Candidates(p, elements);
+        return candidates.Count == 0 ? (Rect.Empty, 0) : (candidates[0].Bounds, candidates[0].Handle);
     }
 
-    private static BlockingCollection<Query> StartWorker()
+    // Smallest element first, then its enclosing elements and the captured window.
+    public IReadOnlyList<DetectionCandidate> Candidates(Point pointer, bool elements)
     {
-        var requests = new BlockingCollection<Query>();
-        // A hung provider can occupy one MTA thread for the process; window detection stays available.
-        var thread = new Thread(() =>
+        dispatcher.VerifyAccess();
+        if (disposed) return [];
+        var pixel = new Point(Math.Floor(pointer.X), Math.Floor(pointer.Y));
+        var window = windows.FirstOrDefault(candidate => ContainsPixel(candidate.VisibleBounds, pixel));
+        if (!elements || window == null)
         {
-            foreach (var query in requests.GetConsumingEnumerable())
+            Reset();
+            return window?.Fallback ?? [];
+        }
+
+        if (resolvedWindow != window) ClearResolution();
+        var candidates = AtPixel(window, pixel);
+        if (request?.Window == window && request.Pixel == pixel) return candidates;
+
+        CancelRequest();
+        // Keep the known bounds while a new result is pending, and avoid requerying a
+        // resolved element for minor cursor movement entirely inside its pixel bounds.
+        if (resolved is { Length: > 1 } && candidates[0] == resolved[0] &&
+            (pixel - resolvedPixel).LengthSquared <= 4) return candidates;
+
+        request = new Query(this, window, pixel);
+        try { Worker.Value.Enqueue(request); }
+        catch (Exception e) when (e is InvalidOperationException or ThreadStateException) { Log.Error("UI Automation worker", e); }
+        return candidates;
+    }
+
+    private IReadOnlyList<DetectionCandidate> AtPixel(WindowSnapshot window, Point pixel)
+    {
+        if (resolved == null) return window.Fallback;
+        for (int i = 0; i < resolved.Length - 1; i++)
+        {
+            if (!ContainsPixel(resolved[i].Bounds, pixel)) continue;
+            return i == 0 ? resolved : new ArraySegment<DetectionCandidate>(resolved, i, resolved.Length - i);
+        }
+        return window.Fallback;
+    }
+
+    private void CancelRequest()
+    {
+        if (request != null && Worker.IsValueCreated) Worker.Value.Cancel(request);
+        request = null;
+    }
+
+    private void ClearResolution()
+    {
+        resolvedWindow = null;
+        resolved = null;
+    }
+
+    public void Reset()
+    {
+        dispatcher.VerifyAccess();
+        CancelRequest();
+        ClearResolution();
+    }
+
+    public void Dispose()
+    {
+        dispatcher.VerifyAccess();
+        if (disposed) return;
+        Reset();
+        disposed = true;
+        CandidatesChanged = null;
+    }
+
+    private void Receive(Query query, DetectionCandidate[] candidates)
+    {
+        if (disposed || query != request || query.IsCancelled) return;
+        resolvedWindow = query.Window;
+        resolvedPixel = query.Pixel;
+        resolved = candidates;
+        CandidatesChanged?.Invoke();
+    }
+
+    private sealed class WindowSnapshot(nint handle, uint thread, uint process, Rect bounds, Rect visibleBounds)
+    {
+        public nint Handle { get; } = handle;
+        public Rect VisibleBounds { get; } = visibleBounds;
+        public DetectionCandidate[] Fallback { get; } = new[] { new DetectionCandidate(visibleBounds, handle, true) };
+
+        public bool IsCurrent()
+            => Native.IsWindowVisible(Handle) && !Native.IsIconic(Handle) && !IsCloaked(Handle) &&
+               Native.GetWindowThreadProcessId(Handle, out uint currentProcess) == thread &&
+               currentProcess == process && Native.Bounds(Handle) == bounds;
+    }
+
+    private static WindowSnapshot[] CaptureWindows(Rect screen)
+    {
+        var snapshots = new List<WindowSnapshot>();
+        var className = new System.Text.StringBuilder(128);
+        Native.EnumWindows((handle, _) =>
+        {
+            if (!Native.IsWindowVisible(handle) || Native.IsIconic(handle) || IsCloaked(handle)) return true;
+            var bounds = Native.Bounds(handle);
+            var visible = CoverPixels(bounds, screen);
+            if (visible.IsEmpty) return true;
+            Native.GetClassName(handle, className, className.Capacity);
+            if (className.ToString() is "Progman" or "WorkerW") return true;
+            uint thread = Native.GetWindowThreadProcessId(handle, out uint process);
+            if (thread != 0) snapshots.Add(new WindowSnapshot(handle, thread, process, bounds, visible));
+            return true;
+        }, 0);
+        return snapshots.ToArray();
+    }
+
+    private static bool IsCloaked(nint handle)
+        => Native.DwmGetWindowAttribute(handle, 14, out int cloaked, sizeof(int)) == 0 && cloaked != 0;
+
+    private static bool HasBounds(Rect bounds)
+        => !bounds.IsEmpty && bounds.Width > 0 && bounds.Height > 0 &&
+           double.IsFinite(bounds.Left) && double.IsFinite(bounds.Top) &&
+           double.IsFinite(bounds.Right) && double.IsFinite(bounds.Bottom);
+
+    private static Rect CoverPixels(Rect bounds, Rect clip)
+    {
+        if (!HasBounds(bounds)) return Rect.Empty;
+        var pixels = new Rect(new Point(Math.Floor(bounds.Left), Math.Floor(bounds.Top)),
+                              new Point(Math.Ceiling(bounds.Right), Math.Ceiling(bounds.Bottom)));
+        pixels.Intersect(clip);
+        return pixels.Width >= 2 && pixels.Height >= 2 ? pixels : Rect.Empty;
+    }
+
+    private static bool ContainsPixel(Rect bounds, Point pixel)
+        => pixel.X >= bounds.Left && pixel.X < bounds.Right && pixel.Y >= bounds.Top && pixel.Y < bounds.Bottom;
+
+    private sealed class Query(WindowDetector detector, WindowSnapshot window, Point pixel)
+    {
+        private readonly WeakReference<WindowDetector> owner = new(detector);
+        private readonly Dispatcher targetDispatcher = detector.dispatcher;
+        private volatile bool cancelled;
+        public WindowSnapshot Window { get; } = window;
+        public Point Pixel { get; } = pixel;
+        public long QueuedAt { get; } = Stopwatch.GetTimestamp();
+        public bool IsCancelled => cancelled;
+        public void Cancel() => cancelled = true;
+
+        public void Publish(DetectionCandidate[] candidates)
+        {
+            if (cancelled || targetDispatcher.HasShutdownStarted) return;
+            _ = targetDispatcher.InvokeAsync(() =>
             {
-                Rect result = Rect.Empty;
-                try { result = FindElement(query.Target, query.Point); }
-                catch (Exception e) when (e is ElementNotAvailableException or System.Runtime.InteropServices.COMException or InvalidOperationException or ArgumentException) { }
+                if (owner.TryGetTarget(out var detector)) detector.Receive(this, candidates);
+            }, DispatcherPriority.Background);
+        }
+    }
+
+    private sealed class AutomationWorker
+    {
+        private readonly object gate = new();
+        private readonly List<Query> pending = [];
+        private readonly HashSet<nint> running = [];
+
+        public AutomationWorker()
+        {
+            // A blocked provider leaves a second worker available for another window.
+            for (int i = 0; i < 2; i++)
+            {
+                var thread = new Thread(Run) { IsBackground = true, Name = "Snapaste element detection" };
+                thread.SetApartmentState(ApartmentState.MTA);
+                thread.Start();
+            }
+        }
+
+        public void Enqueue(Query query)
+        {
+            lock (gate)
+            {
+                pending.Add(query);
+                Monitor.PulseAll(gate);
+            }
+        }
+
+        public void Cancel(Query query)
+        {
+            query.Cancel();
+            lock (gate) pending.Remove(query);
+        }
+
+        private Query TakeNext()
+        {
+            lock (gate)
+            {
+                while (true)
+                {
+                    int index = pending.FindLastIndex(query => !running.Contains(query.Window.Handle));
+                    if (index < 0)
+                    {
+                        Monitor.Wait(gate);
+                        continue;
+                    }
+
+                    var query = pending[index];
+                    // Coalesce quick pointer moves before making a cross-process request.
+                    int delay = (int)Math.Ceiling(30 - Stopwatch.GetElapsedTime(query.QueuedAt).TotalMilliseconds);
+                    if (delay > 0)
+                    {
+                        Monitor.Wait(gate, delay);
+                        continue;
+                    }
+                    pending.RemoveAt(index);
+                    running.Add(query.Window.Handle);
+                    return query;
+                }
+            }
+        }
+
+        private void Run()
+        {
+            while (true)
+            {
+                var query = TakeNext();
+                var candidates = query.Window.Fallback;
+                try
+                {
+                    if (!query.IsCancelled) candidates = FindElements(query);
+                }
+                catch (Exception e) when (e is ElementNotAvailableException or COMException or InvalidOperationException or ArgumentException) { }
                 catch (Exception e) when (e is not OutOfMemoryException) { Log.Error("UI Automation provider", e); }
                 finally
                 {
-                    Volatile.Write(ref query.Detector.element, new ElementResult(query.Target, query.Point, result));
-                    Volatile.Write(ref busy, 0);
+                    lock (gate)
+                    {
+                        running.Remove(query.Window.Handle);
+                        Monitor.PulseAll(gate);
+                    }
                 }
+                query.Publish(candidates);
             }
-        }) { IsBackground = true, Name = "Snapaste element detection" };
-        thread.SetApartmentState(ApartmentState.MTA);
-        thread.Start();
-        return requests;
+        }
     }
 
-    private static Rect FindElement(nint target, Point point)
+    private static DetectionCandidate[] FindElements(Query query)
     {
-        // The overlay covers the target, so search the target's own tree.
-        var current = AutomationElement.FromHandle(target);
+        var window = query.Window;
+        if (!window.IsCurrent()) return window.Fallback;
+
+        // Hit testing the live desktop would return the screenshot overlay.
+        // Walk only the captured window, using cached geometry on each navigation call.
+        var root = AutomationElement.FromHandle(window.Handle);
         var walker = TreeWalker.RawViewWalker;
-        var result = Rect.Empty;
-        int visited = 0;
-        for (int depth = 0; depth < 15 && visited < 350; depth++)
-        {
-            AutomationElement? inside = null;
-            for (var child = walker.GetFirstChild(current); child != null && visited++ < 350; child = walker.GetNextSibling(child))
-            {
-                var bounds = child.Current.BoundingRectangle;
-                if (!bounds.IsEmpty && bounds.Contains(point) && bounds.Width > 3 && bounds.Height > 3)
-                {
-                    inside = child;
-                    result = bounds;
-                    break;
-                }
-            }
-            if (inside == null) break;
-            current = inside;
-        }
+        var cache = new CacheRequest { TreeScope = TreeScope.Element, TreeFilter = Automation.RawViewCondition };
+        cache.Add(AutomationElement.BoundingRectangleProperty);
+        cache.Add(AutomationElement.IsOffscreenProperty);
+        long started = Stopwatch.GetTimestamp();
+        var bounds = FindHierarchy(root, query.Pixel, window.VisibleBounds,
+            element => walker.GetFirstChild(element, cache),
+            element => walker.GetNextSibling(element, cache),
+            element => (element.Cached.BoundingRectangle, element.Cached.IsOffscreen),
+            () => query.IsCancelled || Stopwatch.GetElapsedTime(started).TotalMilliseconds >= 300);
+
+        if (query.IsCancelled || bounds.Length == 0 || !window.IsCurrent()) return window.Fallback;
+        var result = new DetectionCandidate[bounds.Length + 1];
+        for (int i = 0; i < bounds.Length; i++) result[i] = new(bounds[i], window.Handle, false);
+        result[^1] = window.Fallback[0];
         return result;
+    }
+
+    private static Rect[] FindHierarchy<T>(
+        T root, Point point, Rect windowBounds, Func<T, T?> firstChild, Func<T, T?> nextSibling,
+        Func<T, (Rect Bounds, bool IsOffscreen)> geometry, Func<bool> stop) where T : class
+    {
+        const int maximumDepth = 16, maximumNodes = 240;
+        var path = new List<Rect>();
+        Rect[] best = [];
+        int visited = 0;
+        double bestArea = double.PositiveInfinity;
+
+        bool CanContinue() => visited < maximumNodes && !stop();
+
+        void Visit(T parent, Rect clip, int depth)
+        {
+            if (depth >= maximumDepth || !CanContinue()) return;
+            var child = firstChild(parent);
+            while (child != null && CanContinue())
+            {
+                visited++;
+                var (bounds, offscreen) = geometry(child);
+                if (!offscreen)
+                {
+                    // Providers can return a layout container without a rectangle.
+                    var covered = HasBounds(bounds) ? CoverPixels(bounds, clip) : clip;
+                    if (ContainsPixel(covered, point))
+                    {
+                        bool narrows = covered != clip;
+                        if (narrows)
+                        {
+                            path.Add(covered);
+                            double area = covered.Width * covered.Height;
+                            if (area < bestArea || area == bestArea && path.Count > best.Length)
+                            {
+                                bestArea = area;
+                                best = path.ToArray();
+                            }
+                        }
+                        Visit(child, covered, depth + 1);
+                        if (narrows) path.RemoveAt(path.Count - 1);
+                    }
+                }
+                if (!CanContinue()) break;
+                child = nextSibling(child);
+            }
+        }
+
+        Visit(root, windowBounds, 0);
+        Array.Reverse(best);
+        return best;
     }
 }
