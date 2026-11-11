@@ -1,15 +1,21 @@
+using System.Collections.Concurrent;
 using System.Windows.Automation;
+using Snapaste.Core;
 using Snapaste.Platform;
 namespace Snapaste.Capture;
 
 public sealed class WindowDetector
 {
-    private bool querying;
-    private Rect element = Rect.Empty;
-    private Point lastPoint;
+    private sealed record Query(WindowDetector Detector, nint Target, Point Point);
+    private sealed record ElementResult(nint Target, Point Point, Rect Bounds);
+    private static readonly Lazy<BlockingCollection<Query>> Requests = new(StartWorker);
+    private static int busy;
+    private ElementResult? element;
+
     public (Rect Bounds, nint Handle) Find(Point p, bool elements)
     {
-        nint target = 0; Rect found = Rect.Empty;
+        nint target = 0;
+        Rect found = Rect.Empty;
         Native.EnumWindows((h, _) =>
         {
             if (!Native.IsWindowVisible(h) || Native.IsIconic(h)) return true;
@@ -19,41 +25,77 @@ public sealed class WindowDetector
             if (cloaked != 0) return true;
             var r = Native.Bounds(h);
             if (r.Width < 2 || r.Height < 2 || !r.Contains(p)) return true;
-            var name = new System.Text.StringBuilder(128); Native.GetClassName(h, name, name.Capacity);
+            var name = new System.Text.StringBuilder(128);
+            Native.GetClassName(h, name, name.Capacity);
             if (name.ToString() is "Progman" or "WorkerW") return true;
-            target = h; found = r; return false;
+            target = h;
+            found = r;
+            return false;
         }, 0);
-        if (elements && !querying && (p - lastPoint).Length > 4)
+
+        if (!elements || target == 0) return (found, target);
+        var previous = Volatile.Read(ref element);
+        if ((previous == null || previous.Target != target || (p - previous.Point).LengthSquared > 16) &&
+            Interlocked.CompareExchange(ref busy, 1, 0) == 0)
         {
-            querying = true; lastPoint = p;
-            // UIA providers may hang. At most one background query is outstanding.
-            _ = Task.Run(() =>
+            try { Requests.Value.Add(new(this, target, p)); }
+            catch (Exception e) when (e is InvalidOperationException or ThreadStateException)
+            {
+                Volatile.Write(ref busy, 0);
+                Log.Error("UI Automation worker", e);
+            }
+        }
+        return previous != null && previous.Target == target && previous.Bounds.Contains(p) && found.Contains(previous.Bounds)
+            ? (previous.Bounds, target) : (found, target);
+    }
+
+    private static BlockingCollection<Query> StartWorker()
+    {
+        var requests = new BlockingCollection<Query>();
+        // A hung provider can occupy one MTA thread for the process; window detection stays available.
+        var thread = new Thread(() =>
+        {
+            foreach (var query in requests.GetConsumingEnumerable())
             {
                 Rect result = Rect.Empty;
-                try
+                try { result = FindElement(query.Target, query.Point); }
+                catch (Exception e) when (e is ElementNotAvailableException or System.Runtime.InteropServices.COMException or InvalidOperationException or ArgumentException) { }
+                catch (Exception e) when (e is not OutOfMemoryException) { Log.Error("UI Automation provider", e); }
+                finally
                 {
-                    // Overlay is above the target. Search within the target tree instead of FromPoint.
-                    if (target != 0)
-                    {
-                        var root = AutomationElement.FromHandle(target); var walker = TreeWalker.RawViewWalker;
-                        var current = root; int visited = 0;
-                        for (int depth = 0; depth < 15; depth++)
-                        {
-                            AutomationElement? inside = null;
-                            for (var child = walker.GetFirstChild(current); child != null && visited++ < 350; child = walker.GetNextSibling(child))
-                            {
-                                var r = child.Current.BoundingRectangle;
-                                if (!r.IsEmpty && r.Contains(p) && r.Width > 3 && r.Height > 3) { inside = child; result = r; break; }
-                            }
-                            if (inside == null) break;
-                            current = inside;
-                        }
-                    }
+                    Volatile.Write(ref query.Detector.element, new ElementResult(query.Target, query.Point, result));
+                    Volatile.Write(ref busy, 0);
                 }
-                catch (Exception e) when (e is ElementNotAvailableException or System.Runtime.InteropServices.COMException or InvalidOperationException) { }
-                Application.Current.Dispatcher.BeginInvoke(() => { element = result; querying = false; });
-            });
+            }
+        }) { IsBackground = true, Name = "Snapaste element detection" };
+        thread.SetApartmentState(ApartmentState.MTA);
+        thread.Start();
+        return requests;
+    }
+
+    private static Rect FindElement(nint target, Point point)
+    {
+        // The overlay covers the target, so search the target's own tree.
+        var current = AutomationElement.FromHandle(target);
+        var walker = TreeWalker.RawViewWalker;
+        var result = Rect.Empty;
+        int visited = 0;
+        for (int depth = 0; depth < 15 && visited < 350; depth++)
+        {
+            AutomationElement? inside = null;
+            for (var child = walker.GetFirstChild(current); child != null && visited++ < 350; child = walker.GetNextSibling(child))
+            {
+                var bounds = child.Current.BoundingRectangle;
+                if (!bounds.IsEmpty && bounds.Contains(point) && bounds.Width > 3 && bounds.Height > 3)
+                {
+                    inside = child;
+                    result = bounds;
+                    break;
+                }
+            }
+            if (inside == null) break;
+            current = inside;
         }
-        return (elements && !element.IsEmpty && element.Contains(p) && found.Contains(element) ? element : found, target);
+        return result;
     }
 }

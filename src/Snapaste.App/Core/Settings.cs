@@ -33,12 +33,14 @@ public sealed class Settings
     public string Language { get; set; } = "zh-CN";
     public bool StartWithWindows { get; set; }
     public static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
+    public static bool Exists => File.Exists(FilePath);
+    private static string FilePath => Path.Combine(Paths.Data, "settings.json");
     public static Settings Load()
     {
-        try { return JsonSerializer.Deserialize<Settings>(File.ReadAllText(Path.Combine(Paths.Data, "settings.json"))) ?? new(); }
-        catch (Exception e) when (e is IOException or JsonException) { return new(); }
+        try { return JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new(); }
+        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { return new(); }
     }
-    public void Save() => AtomicFile.Write(Path.Combine(Paths.Data, "settings.json"), JsonSerializer.Serialize(this, Json));
+    public void Save() => AtomicFile.Write(FilePath, JsonSerializer.Serialize(this, Json));
 }
 public static class Paths
 {
@@ -50,11 +52,37 @@ public static class Paths
 }
 public static class AtomicFile
 {
-    public static void Write(string path, string data)
+    public static void Write(string path, string data) => Write(path, stream =>
     {
-        var temp = path + ".tmp";
-        File.WriteAllText(temp, data);
-        File.Move(temp, path, true);
+        using var writer = new StreamWriter(stream, leaveOpen: true);
+        writer.Write(data);
+    });
+
+    public static void Write(string path, Action<Stream> write)
+    {
+        path = Path.GetFullPath(path);
+        var directory = Path.GetDirectoryName(path) ?? throw new ArgumentException("无法确定文件保存目录。", nameof(path));
+        var temp = Path.Combine(directory, $".snapaste-{Guid.NewGuid():N}.tmp");
+        bool created = false;
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                created = true;
+                write(stream);
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, path, overwrite: true);
+            created = false;
+        }
+        finally
+        {
+            if (created)
+            {
+                try { File.Delete(temp); }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log.Error("Temporary file cleanup", e); }
+            }
+        }
     }
 }
 public static class Log
@@ -63,6 +91,6 @@ public static class Log
     public static void Error(string category, Exception? error = null)
     {
         try { lock (Gate) { var p = Path.Combine(Paths.Data, "snapaste.log"); if (File.Exists(p) && new FileInfo(p).Length > 2_000_000) File.Move(p, p + ".old", true); File.AppendAllText(p, $"{DateTimeOffset.Now:O} {category} {error?.GetType().Name}: {error?.Message}\n{error?.StackTrace}\n"); } }
-        catch (IOException) { }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 }

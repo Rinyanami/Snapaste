@@ -24,8 +24,8 @@ public static class Native
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(nint h, int attribute, out int value, int size);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool RegisterHotKey(nint h, int id, uint mods, uint key);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(nint h, int id);
-    [DllImport("user32.dll")] public static extern nint GetWindowLongPtr(nint h, int index);
-    [DllImport("user32.dll")] public static extern nint SetWindowLongPtr(nint h, int index, nint value);
+    [DllImport("user32.dll", SetLastError = true)] public static extern nint GetWindowLongPtr(nint h, int index);
+    [DllImport("user32.dll", SetLastError = true)] public static extern nint SetWindowLongPtr(nint h, int index, nint value);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(nint h, nint after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(nint h, uint affinity);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(nint h);
@@ -50,8 +50,15 @@ public static class Native
     public static void ExcludeFromCapture(Window w) => SetWindowDisplayAffinity(Handle(w), 0x11);
     public static void ClickThrough(Window w, bool enabled)
     {
-        var h = Handle(w); var style = GetWindowLongPtr(h, -20).ToInt64();
-        SetWindowLongPtr(h, -20, (nint)(enabled ? style | 0x20 | 0x80000 : style & ~0x20));
+        var handle = Handle(w);
+        var style = GetWindowLongPtr(handle, -20).ToInt64();
+        int error = Marshal.GetLastWin32Error();
+        if (style == 0 && error != 0) throw new System.ComponentModel.Win32Exception(error, "无法读取贴图窗口状态。");
+        var next = enabled ? style | 0x20 | 0x80000 : style & ~0x20;
+        if (next == style) return;
+        var previous = SetWindowLongPtr(handle, -20, (nint)next);
+        error = Marshal.GetLastWin32Error();
+        if (previous == 0 && error != 0) throw new System.ComponentModel.Win32Exception(error, "无法切换贴图鼠标穿透。");
     }
     public static Point ToScreen(Visual v, Point dip) => v.PointToScreen(dip);
     public static Point ToWindow(Visual v, Point pixel) => v.PointFromScreen(pixel);

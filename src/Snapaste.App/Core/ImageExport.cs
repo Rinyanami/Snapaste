@@ -7,42 +7,65 @@ public static class ImageExport
 {
     public static void Save(EditDocument document, string path)
     {
-        var temp = path + ".snapaste-tmp";
-        try
+        switch (Path.GetExtension(path).ToLowerInvariant())
         {
-            if (Path.GetExtension(path).Equals(".png", StringComparison.OrdinalIgnoreCase))
-            {
-                using var file = File.Create(temp); PngStream.Write(document, file);
-            }
-            else
-            {
-                var bitmap = document.Raster(document.Crop);
-                BitmapEncoder encoder = Path.GetExtension(path).ToLowerInvariant() is ".jpg" or ".jpeg" ? new JpegBitmapEncoder { QualityLevel = 94 } : new BmpBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(bitmap)); using var file = File.Create(temp); encoder.Save(file);
-            }
-            File.Move(temp, path, true);
+            case ".png":
+                AtomicFile.Write(path, file => PngStream.Write(document, file));
+                break;
+            case ".jpg":
+            case ".jpeg":
+            case ".bmp":
+                ImageDocument.SaveBitmap(document.Raster(document.Crop), path);
+                break;
+            default:
+                throw new ArgumentException("请选择 PNG、JPEG 或 BMP 格式。", nameof(path));
         }
-        finally { if (File.Exists(temp)) File.Delete(temp); }
     }
+
+    private static string? PickPath(Settings settings, Window? owner)
+    {
+        var ext = settings.DefaultFormat?.ToUpperInvariant() switch { "JPEG" or "JPG" => "jpg", "BMP" => "bmp", _ => "png" };
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            FileName = $"Screenshot_{DateTime.Now:yyyy-MM-dd_HHmmss}",
+            DefaultExt = "." + ext,
+            Filter = "PNG 图片|*.png|JPEG 图片|*.jpg;*.jpeg|BMP 图片|*.bmp",
+            FilterIndex = ext == "jpg" ? 2 : ext == "bmp" ? 3 : 1,
+            InitialDirectory = Directory.Exists(settings.SaveDirectory) ? settings.SaveDirectory : "",
+            AddExtension = true
+        };
+        return dialog.ShowDialog(owner) == true ? dialog.FileName : null;
+    }
+
     public static bool SaveDialog(EditDocument document, Settings settings, Window? owner = null)
     {
-        var ext = settings.DefaultFormat.ToLowerInvariant() == "jpeg" ? "jpg" : settings.DefaultFormat.ToLowerInvariant();
-        var dialog = new Microsoft.Win32.SaveFileDialog { FileName = $"Screenshot_{DateTime.Now:yyyy-MM-dd_HHmmss}.{ext}", Filter = "PNG 图片|*.png|JPEG 图片|*.jpg|BMP 图片|*.bmp", FilterIndex = ext == "jpg" ? 2 : ext == "bmp" ? 3 : 1, InitialDirectory = Directory.Exists(settings.SaveDirectory) ? settings.SaveDirectory : "", AddExtension = true };
-        if (dialog.ShowDialog(owner) != true) return false;
-        Save(document, dialog.FileName); return true;
+        var path = PickPath(settings, owner);
+        if (path == null) return false;
+        Save(document, path);
+        return true;
     }
+
     public static async Task<bool> SaveDialogAsync(EditDocument document, Settings settings, Window owner)
     {
-        var ext = settings.DefaultFormat.ToLowerInvariant() == "jpeg" ? "jpg" : settings.DefaultFormat.ToLowerInvariant();
-        var dialog = new Microsoft.Win32.SaveFileDialog { FileName = $"Screenshot_{DateTime.Now:yyyy-MM-dd_HHmmss}.{ext}", Filter = "PNG 图片|*.png|JPEG 图片|*.jpg|BMP 图片|*.bmp", FilterIndex = ext == "jpg" ? 2 : ext == "bmp" ? 3 : 1, InitialDirectory = Directory.Exists(settings.SaveDirectory) ? settings.SaveDirectory : "", AddExtension = true };
-        if (dialog.ShowDialog(owner) != true) return false;
-        var snapshot = document.Fork(); owner.IsEnabled = false;
-        try { await RenderWorker.Run(() => Save(snapshot, dialog.FileName)); return true; }
-        finally { owner.IsEnabled = true; }
+        var path = PickPath(settings, owner);
+        if (path == null) return false;
+        var snapshot = document.Fork();
+        bool wasEnabled = owner.IsEnabled;
+        owner.IsEnabled = false;
+        try
+        {
+            await RenderWorker.Run(() => Save(snapshot, path));
+            return true;
+        }
+        finally { owner.IsEnabled = wasEnabled; }
     }
+
     public static async Task Copy(EditDocument document)
     {
-        var bitmap = document.Raster(document.Crop);
+        var snapshot = document.Fork();
+        var bitmap = SynchronizationContext.Current is System.Windows.Threading.DispatcherSynchronizationContext
+            ? await RenderWorker.Run(() => snapshot.Raster(snapshot.Crop))
+            : snapshot.Raster(snapshot.Crop);
         for (int i = 0; ; i++)
         {
             try { Clipboard.SetImage(bitmap); return; }
@@ -50,40 +73,101 @@ public static class ImageExport
         }
     }
 }
+
 // PNG is emitted strip by strip; memory is independent of final image height.
 internal static class PngStream
 {
+    private static readonly uint[] CrcTable = CreateCrcTable();
+
     public static void Write(EditDocument doc, Stream destination)
     {
-        int width = (int)doc.Crop.Width, height = (int)doc.Crop.Height;
+        int width = checked((int)doc.Crop.Width), height = checked((int)doc.Crop.Height);
+        if (width <= 0 || height <= 0) throw new ArgumentException("图片尺寸无效。", nameof(doc));
+
         destination.Write(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 });
-        var header = new byte[13]; BinaryPrimitives.WriteInt32BigEndian(header.AsSpan(0), width); BinaryPrimitives.WriteInt32BigEndian(header.AsSpan(4), height); header[8] = 8; header[9] = 2; Chunk(destination, "IHDR", header);
+        Span<byte> header = stackalloc byte[13];
+        header.Clear();
+        BinaryPrimitives.WriteInt32BigEndian(header, width);
+        BinaryPrimitives.WriteInt32BigEndian(header[4..], height);
+        header[8] = 8;
+        header[9] = 2;
+        Chunk(destination, "IHDR"u8, header);
+
         using (var chunks = new IdatStream(destination))
         using (var zip = new ZLibStream(chunks, CompressionLevel.Fastest, true))
         {
-            var rgb = new byte[width * 3 + 1];
-            for (int y = 0; y < height; y += 512)
+            int stride = checked(width * 4);
+            int stripHeight = Math.Min(height, Math.Clamp(8 * 1024 * 1024 / stride, 1, 512));
+            var pixels = new byte[checked(stride * stripHeight)];
+            var rgb = new byte[checked(width * 3 + 1)];
+            for (int y = 0; y < height;)
             {
-                int rows = Math.Min(512, height - y); var bitmap = doc.Raster(new Rect(doc.Crop.X, doc.Crop.Y + y, width, rows));
-                var pixels = new byte[width * rows * 4]; bitmap.CopyPixels(pixels, width * 4, 0);
-                for (int row = 0; row < rows; row++) { for (int x = 0; x < width; x++) { int p = (row * width + x) * 4, q = x * 3 + 1; rgb[q] = pixels[p + 2]; rgb[q + 1] = pixels[p + 1]; rgb[q + 2] = pixels[p]; } zip.Write(rgb); }
+                int rows = Math.Min(stripHeight, height - y);
+                var bitmap = doc.Raster(new Rect(doc.Crop.X, doc.Crop.Y + y, width, rows));
+                bitmap.CopyPixels(pixels, stride, 0);
+                for (int row = 0; row < rows; row++)
+                {
+                    int source = row * stride;
+                    for (int x = 1; x < rgb.Length; x += 3, source += 4)
+                    {
+                        rgb[x] = pixels[source + 2];
+                        rgb[x + 1] = pixels[source + 1];
+                        rgb[x + 2] = pixels[source];
+                    }
+                    zip.Write(rgb);
+                }
+                y += rows;
             }
         }
-        Chunk(destination, "IEND", []);
+        Chunk(destination, "IEND"u8, []);
     }
-    private static void Chunk(Stream stream, string kind, ReadOnlySpan<byte> data)
+
+    private static void Chunk(Stream stream, ReadOnlySpan<byte> type, ReadOnlySpan<byte> data)
     {
-        Span<byte> length = stackalloc byte[4]; BinaryPrimitives.WriteInt32BigEndian(length, data.Length); stream.Write(length);
-        var type = System.Text.Encoding.ASCII.GetBytes(kind); stream.Write(type); stream.Write(data);
-        uint crc = 0xffffffff; foreach (var b in type) crc = Crc(crc, b); foreach (var b in data) crc = Crc(crc, b); BinaryPrimitives.WriteUInt32BigEndian(length, crc ^ 0xffffffff); stream.Write(length);
+        Span<byte> number = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(number, data.Length);
+        stream.Write(number);
+        stream.Write(type);
+        stream.Write(data);
+        uint crc = 0xffffffff;
+        foreach (var b in type) crc = CrcTable[(crc ^ b) & 0xff] ^ (crc >> 8);
+        foreach (var b in data) crc = CrcTable[(crc ^ b) & 0xff] ^ (crc >> 8);
+        BinaryPrimitives.WriteUInt32BigEndian(number, crc ^ 0xffffffff);
+        stream.Write(number);
     }
-    private static uint Crc(uint crc, byte b) { crc ^= b; for (int i = 0; i < 8; i++) crc = (crc >> 1) ^ (0xedb88320u & (uint)-(int)(crc & 1)); return crc; }
+
+    private static uint[] CreateCrcTable()
+    {
+        var table = new uint[256];
+        for (uint i = 0; i < table.Length; i++)
+        {
+            uint crc = i;
+            for (int bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0xedb88320u & (uint)-(int)(crc & 1));
+            table[i] = crc;
+        }
+        return table;
+    }
+
     private sealed class IdatStream(Stream target) : Stream
     {
-        public override bool CanRead => false; public override bool CanSeek => false; public override bool CanWrite => true;
-        public override long Length => throw new NotSupportedException(); public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
         public override void Write(byte[] buffer, int offset, int count) => Write(buffer.AsSpan(offset, count));
-        public override void Write(ReadOnlySpan<byte> buffer) { while (!buffer.IsEmpty) { int n = Math.Min(65536, buffer.Length); Chunk(target, "IDAT", buffer[..n]); buffer = buffer[n..]; } }
-        public override void Flush() => target.Flush(); public override int Read(byte[] b, int o, int c) => throw new NotSupportedException(); public override long Seek(long o, SeekOrigin s) => throw new NotSupportedException(); public override void SetLength(long v) => throw new NotSupportedException();
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            while (!buffer.IsEmpty)
+            {
+                int n = Math.Min(65536, buffer.Length);
+                Chunk(target, "IDAT"u8, buffer[..n]);
+                buffer = buffer[n..];
+            }
+        }
+        public override void Flush() => target.Flush();
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
     }
 }
