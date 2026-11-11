@@ -1,5 +1,6 @@
 using Snapaste.Core;
 using Snapaste.UI;
+using Snapaste.Ocr;
 namespace Snapaste.Editor;
 
 public sealed class EditorWindow : Window
@@ -21,16 +22,19 @@ public sealed class EditorWindow : Window
     private bool updatingOptions;
     private readonly Button undo, redo, delete;
     private bool exporting;
+    private readonly Grid contentRoot = new();
+    private OcrPanel? ocrPanel;
     public event Action<EditDocument>? PinRequested;
     public event Action<EditDocument>? Completed;
     public EditorWindow(ImageDocument image, Tool tool = Tool.Select, EditDocument? document = null)
     {
         Document = document ?? new(image); Title = "Snapaste · 编辑"; Width = 1140; Height = 790; MinWidth = 800; MinHeight = 460; WindowStartupLocation = WindowStartupLocation.CenterScreen; Ui.Setup(this);
-        var dock = new DockPanel(); Content = dock;
+        var dock = new DockPanel(); contentRoot.Children.Add(dock); Content = contentRoot;
         var top = new StackPanel(); var topBorder = new Border { Child = top, BorderThickness = new Thickness(0, 0, 0, 1) }; topBorder.SetResourceReference(Border.BackgroundProperty, "PanelBrush"); topBorder.SetResourceReference(Border.BorderBrushProperty, "BorderBrush"); DockPanel.SetDock(topBorder, Dock.Top); dock.Children.Add(topBorder);
         var header = new DockPanel { Margin = new Thickness(18, 10, 18, 6), LastChildFill = false }; top.Children.Add(header);
         var title = new StackPanel { VerticalAlignment = VerticalAlignment.Center }; title.Children.Add(Ui.Label(image.Kind == "Scroll" ? "长截图编辑" : "截图编辑", 17)); var hint = Ui.Label("标注后，复制或留作参考。", 11, true); hint.Margin = new Thickness(0, 3, 0, 0); title.Children.Add(hint); header.Children.Add(title);
         var output = new StackPanel { Orientation = Orientation.Horizontal }; DockPanel.SetDock(output, Dock.Right); header.Children.Add(output);
+        output.Children.Add(Ui.Action("Ocr", Strings.T("Ocr"), ShowOcr, hint: Strings.T("OcrShortcut")));
         output.Children.Add(Ui.Action("Pin", Strings.T("Pin"), () => { if (exporting) return; PinRequested?.Invoke(Document); Completed?.Invoke(Document); Close(); }));
         output.Children.Add(Ui.Action("Save", Strings.T("Save"), Save, hint: "保存图片 · Ctrl+S"));
         output.Children.Add(Ui.Tool("Copy", "仅复制", () => Copy(false), "复制并继续编辑 · Ctrl+C"));
@@ -73,9 +77,11 @@ public sealed class EditorWindow : Window
         viewport.ScrollChanged += (_, _) => RefreshViewport(); surface.Changed += Update;
         PreviewKeyDown += (_, e) =>
         {
+            if (ocrPanel != null) { if (e.Key == Key.Escape) { ocrPanel.Dismiss(); e.Handled = true; } return; }
             if (e.OriginalSource is TextBox or ComboBox) return;
             if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
             {
+                if (e.Key == Key.O && Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) { ShowOcr(); e.Handled = true; }
                 if (e.Key == Key.Z) { History(false); e.Handled = true; }
                 if (e.Key == Key.Y) { History(true); e.Handled = true; }
                 if (e.Key == Key.S) { Save(); e.Handled = true; }
@@ -88,7 +94,25 @@ public sealed class EditorWindow : Window
                 else if (KeyTool(e.Key) is Tool selected) { Select(selected); e.Handled = true; }
             }
         };
-        Loaded += (_, _) => { Fit(); Select(tool); }; Update();
+        Loaded += (_, _) => { Fit(); Select(tool); }; Closed += (_, _) => ocrPanel?.Dismiss();
+        contentRoot.SizeChanged += (_, _) => SizeOcr(); Update();
+    }
+    private void ShowOcr()
+    {
+        if (exporting || ocrPanel != null) return;
+        surface.CancelPointer(); surface.EndStyleEdit();
+        var panel = new OcrPanel(movable: false) { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        panel.CopyCompleted += panel.Dismiss;
+        var shade = new Border { Background = new SolidColorBrush(Color.FromArgb(90, 0, 0, 0)), Child = panel };
+        ocrPanel = panel; contentRoot.Children.Add(shade);
+        panel.CloseRequested += () => { contentRoot.Children.Remove(shade); if (ReferenceEquals(ocrPanel, panel)) ocrPanel = null; surface.Focus(); };
+        SizeOcr(); panel.Focus(); _ = panel.RecognizeAsync(Document.Fork());
+    }
+    private void SizeOcr()
+    {
+        if (ocrPanel is not { } panel) return;
+        panel.Width = Math.Max(280, Math.Min(600, contentRoot.ActualWidth - 24));
+        panel.Height = Math.Max(280, Math.Min(550, contentRoot.ActualHeight - 24));
     }
     private static string Shortcut(Tool tool) => tool switch { Tool.Select => "V", Tool.Rectangle => "R", Tool.Ellipse => "E", Tool.Line => "L", Tool.Arrow => "A", Tool.Pen => "P", Tool.Highlighter => "H", Tool.Text => "T", Tool.Mosaic => "M", Tool.Blur => "B", Tool.Crop => "X", Tool.Color => "I", _ => "" };
     private static Tool? KeyTool(Key key) => key switch { Key.V => Tool.Select, Key.R => Tool.Rectangle, Key.E => Tool.Ellipse, Key.L => Tool.Line, Key.A => Tool.Arrow, Key.P => Tool.Pen, Key.H => Tool.Highlighter, Key.T => Tool.Text, Key.M => Tool.Mosaic, Key.B => Tool.Blur, Key.X => Tool.Crop, Key.I => Tool.Color, _ => null };

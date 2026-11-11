@@ -3,6 +3,8 @@ $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 $dotnet = if (Test-Path '.tools\dotnet\dotnet.exe') { (Resolve-Path '.tools\dotnet\dotnet.exe').Path } else { (Get-Command dotnet -ErrorAction Stop).Source }
+& (Join-Path $PSScriptRoot 'scripts/Get-OcrModels.ps1')
+if (-not $?) { throw 'OCR model preparation failed' }
 & $dotnet restore Snapaste.sln
 if ($LASTEXITCODE -ne 0) { throw 'Restore failed' }
 & $dotnet build Snapaste.sln -c Release --no-restore -warnaserror

@@ -2,7 +2,17 @@
 
 独立实现的 Windows 本地截图工具，包含区域截图、对象标注、悬浮贴图、历史记录与通用纵向滚动拼接。代码不使用 Snipaste 的程序、源码、图标或资源。
 
-**当前为 0.5.1 开发预览版，尚未达到完整替代 Snipaste 的日常稳定性验收。** 修复经过隔离后台与离屏回归。按用户要求，本轮不操作桌面，浏览器、第三方聊天/文档软件、混合 DPI 和新版实际手感仍待实机验收。详见 [VALIDATION.md](VALIDATION.md)。
+**当前为 0.6.0 开发预览版，尚未达到完整替代 Snipaste 的日常稳定性验收。** 普通截图可原位标注并提取文字。浏览器、第三方聊天/文档软件与混合 DPI 的完整验收仍待完成，详见 [VALIDATION.md](VALIDATION.md)。
+
+## 0.6 离线文字识别（OCR）
+
+框选后点击 **提取文字**，或按 `Ctrl+Shift+O`。结果直接出现在截图界面内，可以修改或保存为 UTF-8 文本；**复制并完成**（`Ctrl+Enter`）复制文字并退出截图，随后即可粘贴。`Esc` 返回原截图，标注和选区保持不变。长图、历史和贴图编辑视图也提供相同入口，复制后返回原编辑视图。
+
+使用随软件附带的 PP-OCRv6 中英文多语言模型，在本机识别，不上传图片或文字，不需要账号和联网。模型在第一次识别时加载；识别可停止，长图分段处理。
+
+默认按局部语境整理中文/英文标点，同时保护能识别的网址、邮箱、数字、版本号、路径和代码。也可选择中文标点、英文标点或还原原文；切换处理方式和手工修改均可撤销。原始识别结果始终可以展开对照，低置信度行会提示核对。
+
+OCR 不能保证所有字体和低清图片零误差：`O/0`、`I/l/1`、罕见符号、缺损标点仍可能识别错误；规则不猜改字母数字，语境不明确的标点保留原样。仅对同一行中明显成对的中文弯引号修正开闭方向；不成对或含糊的引号及不支持的括号样式保留。重要内容应对照截图确认。
 
 ## 0.5.1 图形选择与调整
 
@@ -45,10 +55,10 @@
 ## 运行
 
 - 推荐 Windows 11 x64；目标兼容 Windows 10 2004 / build 19041 以上，尚未在 Windows 10 实机验证。
-- 已发布版本见 [GitHub 预览版](https://github.com/Rinyanami/Snapaste/releases)。本地新版解压 `artifacts/Snapaste-0.5.0-win-x64.zip`，运行其中 `Snapaste.exe`。自带 .NET 10 运行时，无需安装 SDK；本地打包不代表已经上传新版本。
+- 已发布版本见 [GitHub 预览版](https://github.com/Rinyanami/Snapaste/releases)。本地新版解压 `artifacts/Snapaste-0.6.0-win-x64.zip`，运行其中 `Snapaste.exe`。自带 .NET 10、OCR 模型和原生运行库，无需安装 SDK；本地打包不代表已经上传新版本。
 - 普通 Release：`src/Snapaste.App/bin/Release/net10.0-windows/Snapaste.exe`，需要 .NET 10 Windows Desktop Runtime。
 - 首次运行打开设置中的上手入口，之后默认只显示系统托盘图标。双击托盘截图；右键打开设置、历史、滚动截图或退出。再次启动会打开现有实例的设置。
-- 无账号、服务器、网络请求、遥测或 AI。所有图像处理在本机完成。
+- 无账号、服务器、运行时网络请求或遥测。包含本地 OCR 模型，不使用云端或生成式 AI。所有图像处理在本机完成。
 
 ## 快捷键与操作
 
@@ -94,11 +104,12 @@ F1 后点击候选窗口，或拖动框选。选择工具下，边缘八个控�
 
 ```powershell
 dotnet restore
+./scripts/Get-OcrModels.ps1
 dotnet build -c Release
 .\build.ps1 -Portable
 ```
 
-单个 WPF 项目按 `Capture / Editor / Pin / ScrollCapture / Platform / Core / UI` 解耦。没有外部 NuGet 图像库；使用 Win32 可见桌面捕获、Windows UI Automation、WPF 绘制及独立实现的稳健灰度/梯度重叠匹配。滚动输出与普通截图共用 `ImageDocument` 和编辑器。
+单个 WPF 项目按 `Capture / Editor / Pin / ScrollCapture / Ocr / Platform / Core / UI` 解耦。使用 Win32 可见桌面捕获、Windows UI Automation、WPF 绘制及独立实现的稳健灰度/梯度重叠匹配。OCR 使用 RapidOcrNet、ONNX Runtime、SkiaSharp 与本地 PP-OCRv6 模型；固定版本、模型校验值和许可随工程记录。滚动输出与普通截图共用 `ImageDocument` 和编辑器。
 
 长图按文件分段保留，编辑只绘制视口内段落，PNG 按 512 行条带导出。复制/贴图/JPEG/BMP 合成限制为 6400 万像素，超过会提示保存 PNG 或裁剪。
 

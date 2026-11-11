@@ -9,10 +9,23 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>Snapaste</AssemblyName>
-    <Version>0.5.1</Version>
+    <Version>0.6.0</Version>
     <PlatformTarget>x64</PlatformTarget>
     <StartupObject>Snapaste.App</StartupObject>
     <!-- WPF owns DPI via the manifest. WinForms is used only for NotifyIcon. -->
     <NoWarn>$(NoWarn);WFO0003</NoWarn>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="RapidOcrNet" Version="4.2.0" ExcludeAssets="build;buildTransitive" />
+    <OcrModel Include="Ocr/Models/PP-OCRv6_det_small.onnx;Ocr/Models/PP-OCRv6_rec_small.onnx;Ocr/Models/ppocrv6_small_dict.txt;Ocr/Models/ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx" />
+    <OcrRuntime Include="Ocr/Runtime/vcruntime140.dll;Ocr/Runtime/vcruntime140_1.dll;Ocr/Runtime/msvcp140.dll;Ocr/Runtime/msvcp140_1.dll" />
+    <Content Include="@(OcrModel);Ocr/Models/*LICENSE.txt;Ocr/Models/*NOTICE.txt;Ocr/Models/README.md"
+             Link="ocr-models/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="@(OcrRuntime)" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="ThirdParty/*.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="CheckOcrModels" BeforeTargets="PrepareForBuild" Condition="'$(DesignTimeBuild)' != 'true'">
+    <Error Condition="!Exists('%(OcrModel.Identity)')" Text="Missing OCR model %(OcrModel.Identity). Run scripts/Get-OcrModels.ps1 before building." />
+    <Error Condition="!Exists('%(OcrRuntime.Identity)')" Text="Missing OCR runtime %(OcrRuntime.Identity). Run scripts/Get-OcrModels.ps1 before building." />
+  </Target>
 </Project>

@@ -6,3 +6,10 @@ app package/
 .vs/
 *.user
 *.log
+/src/Snapaste.App/Ocr/Models/PP-OCRv6_det_small.onnx
+/src/Snapaste.App/Ocr/Models/PP-OCRv6_rec_small.onnx
+/src/Snapaste.App/Ocr/Models/ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx
+/src/Snapaste.App/Ocr/Models/ppocrv6_small_dict.txt
+/src/Snapaste.App/Ocr/Models/*.partial
+/src/Snapaste.App/Ocr/Runtime/*.dll
+/src/Snapaste.App/Ocr/Runtime/*.partial

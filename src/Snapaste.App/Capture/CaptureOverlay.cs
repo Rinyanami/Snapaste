@@ -3,6 +3,7 @@ using Snapaste.Core;
 using Snapaste.Editor;
 using Snapaste.Platform;
 using Snapaste.UI;
+using Snapaste.Ocr;
 namespace Snapaste.Capture;
 
 public sealed class CaptureOverlay : Window
@@ -16,7 +17,7 @@ public sealed class CaptureOverlay : Window
     private readonly EditorSurface annotations;
     private readonly Canvas root = new();
     private readonly Border toolbar;
-    private readonly WrapPanel toolbarItems = new() { MaxWidth = 900 }, options = new();
+    private readonly WrapPanel toolbarItems = new() { MaxWidth = 1024 }, options = new();
     private readonly StackPanel palette = new() { Orientation = Orientation.Horizontal }, sizeOptions = new() { Orientation = Orientation.Horizontal };
     private readonly WrapPanel textOptions = new();
     private readonly Slider sizeSlider = new() { Minimum = 2, Maximum = 40, Value = 5, Width = 90, VerticalAlignment = VerticalAlignment.Center };
@@ -28,6 +29,7 @@ public sealed class CaptureOverlay : Window
     private readonly List<(Color Color, Button Button)> colors = [];
     private readonly Button undo, redo, delete;
     private TextBox? textInput;
+    private OcrPanel? ocrPanel;
     private Annotation? textOriginal, textDraft;
     private bool addingText, updatingTextOptions, exporting, closed;
     private Rect selected = Rect.Empty, candidate = Rect.Empty, initial;
@@ -65,6 +67,7 @@ public sealed class CaptureOverlay : Window
         undo = Ui.Tool("Undo", Strings.T("Undo"), () => History(false), "Ctrl+Z"); redo = Ui.Tool("Redo", Strings.T("Redo"), () => History(true), "Ctrl+Y");
         foreach (var button in new[] { delete, undo, redo }) { Compact(button); toolbarItems.Children.Add(button); }
         toolbarItems.Children.Add(Ui.Divider());
+        toolbarItems.Children.Add(Ui.Action("Ocr", Strings.T("Ocr"), ShowOcr, hint: Strings.T("OcrShortcut")));
         toolbarItems.Children.Add(Ui.Action("Scroll", Strings.T("Scroll"), () => Finish("Scroll")));
         foreach (var action in new[] { "Pin", "Save", "Cancel" })
         {
@@ -79,6 +82,7 @@ public sealed class CaptureOverlay : Window
         surface.LostMouseCapture += (_, _) => { if (dragging) CancelCropDrag(); };
         PreviewMouseLeftButtonDown += (_, e) =>
         {
+            if (ocrPanel != null) { if (!Within(e.OriginalSource, ocrPanel)) e.Handled = true; return; }
             if (Within(e.OriginalSource, toolbar) || Within(e.OriginalSource, textInput)) return;
             if (textInput != null)
             {
@@ -88,14 +92,14 @@ public sealed class CaptureOverlay : Window
         };
         PreviewMouseMove += (_, e) =>
         {
-            if (dragging) return;
+            if (dragging || ocrPanel != null) return;
             pointer = Physical(e);
             if (annotations.CurrentTool == Tool.Select) annotations.Cursor = Hit(pointer) switch { 0 or 4 => Cursors.SizeNWSE, 2 or 6 => Cursors.SizeNESW, 1 or 5 => Cursors.SizeNS, 3 or 7 => Cursors.SizeWE, _ => Cursors.Arrow };
             chrome.InvalidateVisual();
         };
         MouseRightButtonDown += (_, e) =>
         {
-            if (exporting) return;
+            if (exporting || ocrPanel != null) return;
             if (Within(e.OriginalSource, toolbar) || textInput != null) return;
             if (selected.IsEmpty) Close();
             else if (annotations.CurrentTool != Tool.Select || annotations.HasSelection) { SelectTool(Tool.Select); annotations.ClearSelection(); }
@@ -103,8 +107,8 @@ public sealed class CaptureOverlay : Window
             e.Handled = true;
         };
         SourceInitialized += (_, _) => Native.PlacePhysical(this, screen);
-        root.SizeChanged += (_, _) => { surface.Width = chrome.Width = root.ActualWidth; surface.Height = chrome.Height = root.ActualHeight; Refresh(); };
-        PreviewKeyDown += Key; Loaded += (_, _) => { Activate(); Focus(); }; Closed += (_, _) => closed = true;
+        root.SizeChanged += (_, _) => { surface.Width = chrome.Width = root.ActualWidth; surface.Height = chrome.Height = root.ActualHeight; Refresh(); PositionOcr(); };
+        PreviewKeyDown += Key; Loaded += (_, _) => { Activate(); Focus(); }; Closed += (_, _) => { closed = true; ocrPanel?.Dismiss(); };
     }
 
     private static void Compact(Button b) { b.Width = b.Height = b.MinHeight = 32; b.Padding = new Thickness(6); b.Margin = new Thickness(1); }
@@ -164,7 +168,7 @@ public sealed class CaptureOverlay : Window
     }
     private void BeginDrag(MouseButtonEventArgs e)
     {
-        if (exporting) return;
+        if (exporting || ocrPanel != null) return;
         CommitText(); start = pointer = Physical(e); initial = selected; initialCrop = Document.Crop; handle = Hit(start);
         if (handle == -2) { target = 0; annotations.ClearSelection(); }
         cropBefore = null;
@@ -249,9 +253,9 @@ public sealed class CaptureOverlay : Window
     }
     private void PositionToolbar()
     {
-        if (selected.IsEmpty) return;
+        if (selected.IsEmpty || ocrPanel != null) return;
         double width = root.ActualWidth, height = root.ActualHeight;
-        toolbar.Visibility = Visibility.Visible; toolbarItems.MaxWidth = options.MaxWidth = Math.Max(150, Math.Min(900, width - 24));
+        toolbar.Visibility = Visibility.Visible; toolbarItems.MaxWidth = options.MaxWidth = Math.Max(150, Math.Min(1024, width - 24));
         toolbar.Measure(new Size(Math.Max(150, width - 12), Math.Max(200, height))); var size = toolbar.DesiredSize; var r = Local(selected);
         Canvas.SetLeft(toolbar, Math.Clamp(r.Right - size.Width, 6, Math.Max(6, width - size.Width - 6)));
         double top = r.Bottom + size.Height + 16 <= height ? r.Bottom + 10 : r.Top - size.Height - 10;
@@ -294,9 +298,42 @@ public sealed class CaptureOverlay : Window
         }
         CancelCropDrag(); annotations.CancelPointer(); annotations.EndStyleEdit(); if (forward) Document.Redo(); else Document.Undo(); Refresh();
     }
+    private void ShowOcr()
+    {
+        if (exporting || ocrPanel != null || selected.IsEmpty) return;
+        CancelCropDrag(); annotations.CancelPointer(); annotations.EndStyleEdit(); CommitText();
+        var panel = new OcrPanel(); ocrPanel = panel;
+        panel.CopyCompleted += Close;
+        root.Children.Add(panel); Panel.SetZIndex(panel, 10);
+        toolbar.Visibility = Visibility.Collapsed;
+        annotations.IsHitTestVisible = surface.IsHitTestVisible = false;
+        panel.CloseRequested += () =>
+        {
+            root.Children.Remove(panel); if (ReferenceEquals(ocrPanel, panel)) ocrPanel = null;
+            annotations.IsHitTestVisible = surface.IsHitTestVisible = true;
+            if (!closed) { Refresh(); annotations.Focus(); }
+        };
+        panel.DragRequested += delta =>
+        {
+            Canvas.SetLeft(panel, Math.Clamp(Canvas.GetLeft(panel) + delta.X, 6, Math.Max(6, root.ActualWidth - panel.Width - 6)));
+            Canvas.SetTop(panel, Math.Clamp(Canvas.GetTop(panel) + delta.Y, 6, Math.Max(6, root.ActualHeight - panel.Height - 6)));
+        };
+        PositionOcr(); panel.Focus(); _ = panel.RecognizeAsync(Document.Fork());
+    }
+    private void PositionOcr()
+    {
+        if (ocrPanel is not { } panel) return;
+        panel.Width = Math.Max(180, Math.Min(560, root.ActualWidth - 24));
+        panel.Height = Math.Max(180, Math.Min(530, root.ActualHeight - 24));
+        var r = Local(selected);
+        double x = r.Right + panel.Width + 18 <= root.ActualWidth ? r.Right + 12 : r.Left >= panel.Width + 18 ? r.Left - panel.Width - 12 : (root.ActualWidth - panel.Width) / 2;
+        Canvas.SetLeft(panel, Math.Clamp(x, 6, Math.Max(6, root.ActualWidth - panel.Width - 6)));
+        Canvas.SetTop(panel, Math.Clamp(r.Top, 6, Math.Max(6, root.ActualHeight - panel.Height - 6)));
+    }
     private static Tool? KeyTool(Key key) => key switch { System.Windows.Input.Key.V => Tool.Select, System.Windows.Input.Key.R => Tool.Rectangle, System.Windows.Input.Key.E => Tool.Ellipse, System.Windows.Input.Key.L => Tool.Line, System.Windows.Input.Key.A => Tool.Arrow, System.Windows.Input.Key.P => Tool.Pen, System.Windows.Input.Key.H => Tool.Highlighter, System.Windows.Input.Key.T => Tool.Text, System.Windows.Input.Key.M => Tool.Mosaic, System.Windows.Input.Key.B => Tool.Blur, System.Windows.Input.Key.X => Tool.Crop, System.Windows.Input.Key.I => Tool.Color, _ => null };
     private void Key(object sender, KeyEventArgs e)
     {
+        if (ocrPanel != null) { if (e.Key == System.Windows.Input.Key.Escape) { ocrPanel.Dismiss(); e.Handled = true; } return; }
         if (exporting) return;
         if (Within(e.OriginalSource, textInput))
         {
@@ -311,7 +348,8 @@ public sealed class CaptureOverlay : Window
         if (e.Key == System.Windows.Input.Key.C && Keyboard.Modifiers == ModifierKeys.None) { try { var c = PixelColor(pointer); Clipboard.SetText($"#{c.R:X2}{c.G:X2}{c.B:X2}"); } catch (Exception ex) { Ui.Error(ex, this); } e.Handled = true; return; }
         if (selected.IsEmpty) return;
         bool control = Keyboard.Modifiers.HasFlag(ModifierKeys.Control);
-        if (control && e.Key is System.Windows.Input.Key.Z or System.Windows.Input.Key.Y) { History(e.Key == System.Windows.Input.Key.Y); e.Handled = true; }
+        if (control && Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) && e.Key == System.Windows.Input.Key.O) { ShowOcr(); e.Handled = true; }
+        else if (control && e.Key is System.Windows.Input.Key.Z or System.Windows.Input.Key.Y) { History(e.Key == System.Windows.Input.Key.Y); e.Handled = true; }
         else if (e.Key == System.Windows.Input.Key.Enter || control && e.Key == System.Windows.Input.Key.C) { Finish("Copy"); e.Handled = true; }
         else if (control && e.Key == System.Windows.Input.Key.S) { Finish("Save"); e.Handled = true; }
         else if (control && e.Key == System.Windows.Input.Key.T) { Finish("Pin"); e.Handled = true; }

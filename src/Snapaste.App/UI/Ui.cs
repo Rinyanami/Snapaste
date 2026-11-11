@@ -98,6 +98,7 @@ internal static class Icons
         ["Pen"] = "M4,14 L3,17 L7,16 L17,6 L14,3 Z M12,5 L15,8",
         ["Highlighter"] = "M4,12 L11,3 L17,8 L10,16 Z M5,13 L3,17 H9",
         ["Text"] = "M3,4 H17 M10,4 V17 M7,17 H13",
+        ["Ocr"] = "M6,2 H2 V6 M14,2 H18 V6 M18,14 V18 H14 M6,18 H2 V14 M5,6 H15 M10,6 V14 M7,14 H13",
         ["Mosaic"] = "M3,3 H8 V8 H3 Z M12,3 H17 V8 H12 Z M3,12 H8 V17 H3 Z M12,12 H17 V17 H12 Z",
         ["Blur"] = "M10,2 C8,6 4,8 4,12 A6,6 0 0 0 16,12 C16,8 12,6 10,2 M7,12 A3,3 0 0 0 10,15",
         ["Crop"] = "M5,2 V15 H18 M2,5 H15 V18",

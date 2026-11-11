@@ -25,6 +25,9 @@ jobs:
           dotnet-version: '10.0.x'
       - name: Restore
         run: dotnet restore Snapaste.sln
+      - name: Fetch and verify offline OCR models
+        shell: pwsh
+        run: ./scripts/Get-OcrModels.ps1
       - name: Compile with warnings as errors
         run: dotnet build Snapaste.sln -c Release --no-restore -warnaserror
       - name: Build portable package
