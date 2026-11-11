@@ -59,7 +59,8 @@ public sealed class Annotation
     public bool HitTest(Point point, double tolerance)
     {
         point = ToLocal(point);
-        var bounds = Bounds; bounds.Inflate(tolerance, tolerance);
+        double strokeExtent = Kind == Tool.Highlighter ? Stroke * 2.5 : Kind == Tool.Arrow ? Stroke * 2 : Stroke / 2;
+        var bounds = Bounds; bounds.Inflate(tolerance + strokeExtent, tolerance + strokeExtent);
         if (!bounds.Contains(point)) return false;
         if (Kind == Tool.Rectangle)
         {
@@ -82,6 +83,18 @@ public sealed class Annotation
             return false;
         }
         return true;
+    }
+    // Selection can use the interior of a closed shape without changing the
+    // stroke-only hit test used when drawing inside an unselected shape.
+    public bool ContainsInterior(Point point)
+    {
+        point = ToLocal(point);
+        if (!Bounds.Contains(point)) return false;
+        if (Kind == Tool.Rectangle) return true;
+        if (Kind != Tool.Ellipse || Bounds.Width <= 0 || Bounds.Height <= 0) return false;
+        double x = (point.X - Bounds.X - Bounds.Width / 2) / (Bounds.Width / 2);
+        double y = (point.Y - Bounds.Y - Bounds.Height / 2) / (Bounds.Height / 2);
+        return x * x + y * y <= 1;
     }
     public void Translate(Vector d) { Bounds = new Rect(Bounds.Location + d, Bounds.Size); for (int i = 0; i < Points.Count; i++) Points[i] += d; }
     public void Resize(Rect next)

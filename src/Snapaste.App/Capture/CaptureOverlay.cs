@@ -84,7 +84,7 @@ public sealed class CaptureOverlay : Window
             {
                 CommitText(); annotations.ClearSelection(); annotations.Focus(); e.Handled = true; return;
             }
-            if (!selected.IsEmpty && annotations.CurrentTool == Tool.Select && Hit(Physical(e)) >= 0 && !annotations.HitSelection(Physical(e) - new Vector(screen.X, screen.Y))) { BeginDrag(e); e.Handled = true; }
+            if (!selected.IsEmpty && annotations.CurrentTool == Tool.Select && Hit(Physical(e)) >= 0 && !annotations.HitAnnotation(Physical(e) - new Vector(screen.X, screen.Y))) { BeginDrag(e); e.Handled = true; }
         };
         PreviewMouseMove += (_, e) =>
         {

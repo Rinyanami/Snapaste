@@ -114,11 +114,21 @@ public sealed class EditorSurface : FrameworkElement
         for (int i = 0; i < points.Length; i++) if ((p - a.ToWorld(points[i])).Length <= radius) return i;
         return -1;
     }
-    public bool HitSelection(Point p) => HitHandle(p) >= 0 || Selection?.HitTest(p, 6 / Zoom) == true;
+    private Annotation? FindAnnotation(Point point)
+    {
+        if (CurrentTool is Tool.Crop or Tool.Color) return null;
+        // Visible strokes win over hollow interiors, so nested objects remain
+        // reachable. A selected shape can be dragged anywhere inside it.
+        var hit = document.Annotations.LastOrDefault(a => a.HitTest(point, 6 / Zoom));
+        if (hit != null) return hit;
+        if (Selection is { } selectedShape && selectedShape.ContainsInterior(point)) return selectedShape;
+        return CurrentTool == Tool.Select ? document.Annotations.LastOrDefault(a => a.ContainsInterior(point)) : null;
+    }
+    public bool HitAnnotation(Point p) => HitHandle(p) >= 0 || FindAnnotation(p) != null;
     private void Down(object sender, MouseButtonEventArgs e)
     {
         Focus(); var p = Pixel(e);
-        if (CurrentTool == Tool.Select && !HasSelection && !document.Annotations.Any(a => a.HitTest(p, 6 / Zoom)) && EmptySelectionDown != null) { EmptySelectionDown(e); return; }
+        if (CurrentTool == Tool.Select && !HasSelection && FindAnnotation(p) == null && EmptySelectionDown != null) { EmptySelectionDown(e); return; }
         if (BeginPointer(p, e.ClickCount)) CaptureMouse(); e.Handled = true;
     }
     internal bool BeginPointer(Point point, int clicks = 1)
@@ -134,7 +144,7 @@ public sealed class EditorSurface : FrameworkElement
         {
             active = Selection; gesture = handle == 8 ? Gesture.Rotate : handle >= 9 ? Gesture.Endpoint : Gesture.Resize;
         }
-        else if (CurrentTool != Tool.Crop && document.Annotations.LastOrDefault(a => a.HitTest(point, 6 / Zoom)) is { } hit)
+        else if (FindAnnotation(point) is { } hit)
         {
             selected = active = hit;
             if (clicks == 2 && hit.Kind == Tool.Text) { EditText(hit, false); Notify(); return false; }
@@ -156,7 +166,7 @@ public sealed class EditorSurface : FrameworkElement
     {
         var p = Pixel(e);
         if (IsMouseCaptured) UpdatePointer(p);
-        else { int h = HitHandle(p); Cursor = h == 8 ? Cursors.Hand : h >= 9 ? Cursors.Cross : h is 0 or 4 ? Cursors.SizeNWSE : h is 2 or 6 ? Cursors.SizeNESW : h is 1 or 5 ? Cursors.SizeNS : h is 3 or 7 ? Cursors.SizeWE : document.Annotations.Any(a => a.HitTest(p, 6 / Zoom)) ? Cursors.SizeAll : CurrentTool == Tool.Text ? Cursors.IBeam : CurrentTool == Tool.Select ? Cursors.Arrow : Cursors.Cross; }
+        else { int h = HitHandle(p); Cursor = h == 8 ? Cursors.Hand : h >= 9 ? Cursors.Cross : h is 0 or 4 ? Cursors.SizeNWSE : h is 2 or 6 ? Cursors.SizeNESW : h is 1 or 5 ? Cursors.SizeNS : h is 3 or 7 ? Cursors.SizeWE : FindAnnotation(p) != null ? Cursors.SizeAll : CurrentTool == Tool.Text ? Cursors.IBeam : CurrentTool == Tool.Select ? Cursors.Arrow : Cursors.Cross; }
     }
     internal void UpdatePointer(Point point)
     {

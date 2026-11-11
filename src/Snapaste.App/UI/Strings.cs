@@ -31,7 +31,7 @@ public static class Strings
         ["OverlayCropHint"] = "拖动保留区域 · Ctrl+Z 撤销裁剪",
         ["OverlayColorHint"] = "点击像素复制 HEX · C 取底图颜色",
         ["OverlayTextHint"] = "拖出文字框 · 双击文字修改",
-        ["ObjectSelectedHint"] = "正在修改选中项 · 拖动调整点缩放 · 顶部圆点旋转",
+        ["ObjectSelectedHint"] = "正在修改选中项 · 拖动移动 · 点空白确认",
         ["ReverseDirection"] = "交换箭头方向",
         ["OverlayDrawHint"] = "拖动绘制 · 右键返回选择 · Ctrl+Z 撤销",
         ["CaptureSelectHint"] = "拖动框选 · 点击选窗口 · Tab 切换识别 · Esc 取消",
