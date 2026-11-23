@@ -1,15 +1,34 @@
-# Snapaste
+<div align="center">
+  <img src="src/Snapaste.App/Assets/Brand/Logo.png" alt="Snapaste Logo" width="84" />
+  <h1>Snapaste</h1>
+  <p>独立实现的 Windows 本地截图工具：智能选区 · 原位标注 · 悬浮贴图 · 滚动长截图 · 本地离线 OCR</p>
+  <p>
+    <a href="https://github.com/Rinyanami/Snapaste/releases"><img src="https://img.shields.io/badge/release-v0.9.0-6D5BD0?style=flat-square" alt="Release v0.9.0" /></a>
+    <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4?style=flat-square" alt="Windows x64" />
+    <img src="https://img.shields.io/badge/.NET-10%20WPF-512BD4?style=flat-square" alt=".NET 10 WPF" />
+  </p>
+</div>
 
-独立实现的 Windows 本地截图工具，包含区域截图、对象标注、悬浮贴图、历史记录与通用纵向滚动拼接。代码不使用 Snipaste 的程序、源码、图标或资源。
+**当前为 0.9.0 版本。** 纯本地离线运行，无账号、无联网遥测、无云端传输；支持普通截图原位标注、实时马赛克/高斯模糊、悬浮贴图、纵向滚动长截图与基于 PP-OCRv6 的本地中英文文字识别。详情与验收记录见 [VALIDATION.md](VALIDATION.md)。
 
-**当前为 0.9.0 版本。** 普通截图可原位标注并提取文字。浏览器、第三方聊天/文档软件与混合 DPI 的完整验收详见 [VALIDATION.md](VALIDATION.md)。
+## 界面演示
+
+| 深色原位标注与平滑画笔 | 浅色原位中文文字输入与格式 | 本地离线 OCR 识字面板 |
+| :---: | :---: | :---: |
+| ![深色原位标注](docs/screenshots/capture-overlay-dark.png) | ![原位中文文字编辑](docs/screenshots/capture-inline-text.png) | ![本地离线 OCR 面板](docs/screenshots/ocr-panel.png) |
+
+## 下载与快速上手
+
+- 前往 [**Releases**](https://github.com/Rinyanami/Snapaste/releases) 下载 `Snapaste-0.9.0-win-x64.zip`（自带 .NET 10 运行时、PP-OCRv6 离线模型与运行库，解压即用）。
+- 默认快捷键：`F1` 截图、`Ctrl+F1` 滚动长截图、`F3` 剪贴板贴图（可在设置中点击输入框直接按键录制修改）。
+- 滚动长截图过程中按 `Enter` 直接拼接保存并退出（无需跳转编辑页），按 `Esc` 立即取消退出；编辑窗口同样支持 `Enter` 保存退出、`Esc` 放弃退出。
 
 ## 0.9.0 性能优化与交互打磨
 
 - **截图启动与识别提速**：`PixelRegionDetector` 改为单次整图内存拷贝，消除数万次逐块 `CopyPixels` P/Invoke；`Capture` 并行预建 `WindowDetector`；`DesktopCapture` 复用 DIB 缓冲区并使用 `SRCCOPY`；UI Automation 优先搜索包含指针的子控件层级并扩大节点预算。
-- **60fps 实时马赛克与模糊**：采用 $O(W \cdot H)$ 三遍滑窗均值模糊替代慢速双精度卷积核，400 万像素以内实时同步渲染，拖动或缩放遮盖区域无需等待灰底预览占位框。
-- **工具栏与标注体验**：固定主工具栏宽度防止切工具时按钮水平跳动；粗体/斜体/下划线/文字背景改为紧凑 `26×26` 状态切换按钮（`B`、`I`、`U`、`底`），线宽滑块旁显示实时像素值；文字背景根据文字明度自动切换深浅半透明圆角底色；画笔与马克笔采用中点二次贝塞尔平滑曲线；取色支持 `C`（HEX）与 `Shift+C`（RGB）并显示浮动提示；独立编辑器支持 `Ctrl+滚轮` 缩放。
-- **贴图、滚动长截图与 OCR**：贴图立即打开窗口并在后台异步落盘，多贴图并行解码恢复，增加焦点高亮边框与缩放/透明度/旋转/穿透瞬态 HUD 角标；滚动长截图移除过严的邻近像素误差门槛、加宽列采样、提速手动连续滚动与自动滚动节奏，并在选区外侧显示穿透式虚线边框指示器；OCR 支持后台预热、无标注选区直接内存拷贝、低置信度精确行号提示以及“复制文字（不关闭窗口）”按钮。
+- **60fps 实时马赛克与模糊**：采用 `O(W × H)` 三遍滑窗均值模糊替代慢速双精度卷积核，400 万像素以内实时同步渲染，拖动或缩放遮盖区域无需等待灰底预览占位框。
+- **工具栏与标注体验**：固定主工具栏宽度防止切工具时按钮水平跳动；粗体/斜体/下划线/文字背景改为紧凑 `26×26` 状态切换按钮（`B`、`I`、`U`、`底`），线宽滑块旁显示实时像素值；文字背景根据文字明度自动切换深浅半透明圆角底色；画笔与马克笔采用中点二次贝塞尔平滑曲线；取色支持 `C`（HEX）与 `Shift+C`（RGB）并显示浮动提示；独立编辑器支持 `Ctrl+滚轮` 缩放、`Enter` 保存退出、`Esc` 放弃退出。
+- **贴图、滚动长截图与 OCR**：贴图立即打开窗口并在后台异步落盘，多贴图并行解码恢复，增加焦点高亮边框与缩放/透明度/旋转/穿透瞬态 HUD 角标；滚动长截图移除过严的邻近像素误差门槛、加宽列采样、提速手动连续滚动与自动滚动节奏，支持在截图过程中按 `Enter` 直接保存退出、`Esc` 取消退出，并在选区外侧显示穿透式虚线边框指示器；OCR 支持后台预热、无标注选区直接内存拷贝、低置信度精确行号提示以及“复制文字（不关闭窗口）”按钮。
 - **深色标题栏与设置/历史增强**：全窗口适配 Windows DWM 深色标题栏与现代右键菜单样式；设置页快捷键输入框支持直接按键录制，保存目录与“选择文件夹”同行排布；历史卡片支持单条删除与双击缩略图进入编辑。
 
 ## 0.8.2 截图响应
