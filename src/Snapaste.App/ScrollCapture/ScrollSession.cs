@@ -9,8 +9,8 @@ public enum ScrollState { Idle, SelectingRegion, Ready, WaitingForScroll, Scroll
 
 public sealed class ScrollSession : IDisposable
 {
-    private const int PollMilliseconds = 150;
-    private const int AutomaticStartDelay = 2500;
+    private const int PollMilliseconds = 75;
+    private const int AutomaticStartDelay = 650;
     private const double MotionThreshold = .004;
     private const string ManualInstructions = "向下滚动，每次保留约 1/3 重叠。停稳后会自动拼接。";
     private const string LimitMessage = "已达到捕获帧数上限。可以撤销上一段，或完成编辑。";
@@ -143,11 +143,38 @@ public sealed class ScrollSession : IDisposable
         var anchor = reference;
         // A change confined to a narrow area must itself settle before matching.
         bool localChange = anchor != null && sample.Difference(anchor) <= MotionThreshold;
-        if (observed == null || sample.Difference(observed, localChange) > MotionThreshold)
+        bool isMoving = observed == null || sample.Difference(observed, localChange) > MotionThreshold;
+        if (isMoving)
         {
             observed = sample;
             stableSince = now;
             unstableSince ??= now;
+            if (anchor != null && !Automatic &&
+                sample.Difference(anchor, includeLocalChanges: true) > MotionThreshold &&
+                (ignoredSample == null || sample.Difference(ignoredSample, includeLocalChanges: true) > MotionThreshold))
+            {
+                int quickTop = TopOverride, quickBottom = BottomOverride;
+                int quickMatchTop = quickTop >= 0 || frames.Count == 1 || appliedTopOverride >= 0 ? quickTop : FixedTop;
+                int quickMatchBottom = quickBottom >= 0 || frames.Count == 1 || appliedBottomOverride >= 0 ? quickBottom : FixedBottom;
+                var quickMatch = await Task.Run(() => ScrollMatcher.Match(anchor, sample, settings.MatchSensitivity, cancellation, quickMatchTop, quickMatchBottom), cancellation);
+                if (generation != epoch || quickTop != TopOverride || quickBottom != BottomOverride) return;
+                int effectiveBody = Math.Max(1, (int)Region.Height - quickMatch.FixedTop - quickMatch.FixedBottom);
+                bool quickFixedChanged = quickMatch.Confidence != Confidence.Low &&
+                    (quickTop < 0 && quickMatchTop >= 0 && ScrollMatcher.FixedBandExpanded(anchor, sample, quickMatchTop, quickMatch.Offset, bottom: false) ||
+                     quickBottom < 0 && quickMatchBottom >= 0 && ScrollMatcher.FixedBandExpanded(anchor, sample, quickMatchBottom, quickMatch.Offset, bottom: true));
+                if (quickMatch.Confidence == Confidence.High &&
+                    !quickFixedChanged &&
+                    CanStitch(quickMatch.Offset, quickMatch.FixedTop, quickMatch.FixedBottom) &&
+                    quickMatch.Offset >= effectiveBody * 0.20 &&
+                    quickMatch.Offset <= effectiveBody * 0.65)
+                {
+                    var quickStored = await WriteFrame(bitmap, sample, generation);
+                    if (quickStored == null) return;
+                    if (quickTop != TopOverride || quickBottom != BottomOverride) { DeleteFrameLater(quickStored); return; }
+                    Commit(quickStored, sample, quickMatch, false);
+                    return;
+                }
+            }
             if (now - unstableSince >= Math.Max(6000L, stableMilliseconds * 3L))
             {
                 Pause("画面持续变化。请等页面停稳后继续，或完成已捕获的内容。");
@@ -287,7 +314,7 @@ public sealed class ScrollSession : IDisposable
             return;
         }
         wheelAttempts++;
-        nextWheel = now + Math.Max(1600L, (long)settings.AutoScrollDelay + settings.StableMilliseconds);
+        nextWheel = now + Math.Max(420L, (long)settings.AutoScrollDelay + settings.StableMilliseconds);
         SetState(ScrollState.WaitingForScroll, "等待页面响应。");
     }
 
@@ -443,10 +470,10 @@ public sealed class ScrollSession : IDisposable
         if (Terminal || State == ScrollState.Paused) return;
         Automatic = true;
         wheelAttempts = 0;
-        wheelUnits = 1;
+        wheelUnits = Math.Clamp((int)Math.Round(Region.Height / 300.0), 2, 5);
         automaticReady = nextWheel = clock.ElapsedMilliseconds + AutomaticStartDelay;
         if (ControlHandle != 0 && Native.GetForegroundWindow() == ControlHandle) Native.SetForegroundWindow(target);
-        SetState(State, "2.5 秒后开始自动滚动。请把鼠标移到选区内，保持目标窗口在前台。");
+        SetState(State, "即将开始自动滚动。请把鼠标移到选区内，保持目标窗口在前台。");
     }
 
     public void Ignore()

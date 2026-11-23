@@ -203,8 +203,14 @@ public sealed class HistoryWindow : Window
     private Border Card(HistoryEntry entry, List<(string Path, Border Frame)> previews)
     {
         var content = new StackPanel { Width = 210 };
-        var imageFrame = new Border { Height = 148, CornerRadius = new CornerRadius(8), ClipToBounds = true, Child = PreviewMessage("HistoryPreviewLoading") };
+        var imageFrame = new Border { Height = 148, CornerRadius = new CornerRadius(8), ClipToBounds = true, Cursor = Cursors.Hand, ToolTip = "双击重新编辑图片", Child = PreviewMessage("HistoryPreviewLoading") };
         imageFrame.SetResourceReference(Border.BackgroundProperty, "CanvasBrush");
+        imageFrame.MouseLeftButtonDown += (_, e) =>
+        {
+            if (e.ClickCount != 2) return;
+            try { App.Current.Edit(entry.Open()); e.Handled = true; }
+            catch (Exception error) { Ui.Error(error, this); }
+        };
         content.Children.Add(imageFrame);
         previews.Add((entry.Thumbnail, imageFrame));
         var metadata = new DockPanel { Margin = new Thickness(0, 14, 0, 5), LastChildFill = false }; var time = Ui.Label(entry.Created.ToString("HH:mm:ss"), 13); time.FontWeight = FontWeights.SemiBold; metadata.Children.Add(time);
@@ -225,6 +231,7 @@ public sealed class HistoryWindow : Window
         AddAction(Strings.T("Pin"), "把图片悬浮在屏幕上", () => App.Current.PinDocument(new(entry.Open())));
         AddAction(Strings.T("Edit"), "重新编辑图片", () => App.Current.Edit(entry.Open()));
         AddAction(Strings.T("Save"), "将图片保存到文件", () => Save(entry));
+        AddAction(Strings.T("Delete"), "从本机历史中删除这张截图", () => DeleteEntry(entry));
         var card = Ui.Card(content, 14);
         card.Margin = new Thickness(0, 0, 14, 14);
         return card;
@@ -294,6 +301,18 @@ public sealed class HistoryWindow : Window
     private async void Save(HistoryEntry entry)
     {
         try { if (await ImageExport.SaveDialogAsync(new(entry.Open()), App.Current.Settings, this)) ShowFeedback("图片已保存", "SuccessBrush"); }
+        catch (Exception e) { Ui.Error(e, this); }
+    }
+    private async void DeleteEntry(HistoryEntry entry)
+    {
+        try
+        {
+            await Task.Run(() => store.Delete(entry.Id));
+            entries.RemoveAll(item => item.Id == entry.Id);
+            summary.Text = $"本机共 {entries.Count} 张截图";
+            Render(false);
+            ShowFeedback("已删除该条截图历史", "SuccessBrush");
+        }
         catch (Exception e) { Ui.Error(e, this); }
     }
 }

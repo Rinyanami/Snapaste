@@ -1,10 +1,13 @@
+using System.Collections.Concurrent;
 using System.Windows.Automation;
 using System.Windows.Data;
 using System.Windows.Media.Effects;
+using Snapaste.Platform;
 namespace Snapaste.UI;
 
 public static class Ui
 {
+    public static bool IsDark { get; private set; }
     public static Brush Accent => Brush("AccentBrush");
     public static Brush Brush(string key) => (Brush)Application.Current.FindResource(key);
     public static TextBlock Label(string text, double size = 12, bool muted = false)
@@ -26,6 +29,20 @@ public static class Ui
         content.Children.Add(Icon(icon)); content.Children.Add(new TextBlock { Text = label, Margin = new Thickness(7, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center }); button.Content = content;
         if (primary) button.SetResourceReference(FrameworkElement.StyleProperty, "PrimaryButton"); return button;
     }
+    private static readonly Lazy<string[]> FontNames = new(() =>
+        Fonts.SystemFontFamilies.Select(f => f.Source).Order().ToArray());
+
+    public static void LoadFontsOnOpen(ComboBox control)
+    {
+        control.DropDownOpened += (_, _) =>
+        {
+            if (control.ItemsSource != null) return;
+            var currentFont = control.Text;
+            control.ItemsSource = FontNames.Value;
+            control.Text = currentFont;
+        };
+    }
+
     public static void ObserveText(ComboBox control, Window owner, Action changed)
     {
         // Observe the ComboBox value, not its template TextBox's routed event:
@@ -55,7 +72,7 @@ public static class Ui
     public static Border Divider() { var line = new Border { Width = 1, Height = 22, Margin = new Thickness(8, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center }; line.SetResourceReference(Border.BackgroundProperty, "BorderBrush"); return line; }
     public static FrameworkElement Icon(string key, double size = 18)
     {
-        var path = new System.Windows.Shapes.Path { Data = Geometry.Parse(Icons.Get(key)), StrokeThickness = 1.5, StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round, StrokeLineJoin = PenLineJoin.Round };
+        var path = new System.Windows.Shapes.Path { Data = Icons.Geometry(key), StrokeThickness = 1.5, StrokeStartLineCap = PenLineCap.Round, StrokeEndLineCap = PenLineCap.Round, StrokeLineJoin = PenLineJoin.Round };
         path.SetBinding(System.Windows.Shapes.Shape.StrokeProperty, new Binding("Foreground") { RelativeSource = new RelativeSource(RelativeSourceMode.FindAncestor, typeof(Control), 1), FallbackValue = Accent });
         var canvas = new Canvas { Width = 20, Height = 20 }; canvas.Children.Add(path); return new Viewbox { Child = canvas, Width = size, Height = size, VerticalAlignment = VerticalAlignment.Center };
     }
@@ -65,28 +82,38 @@ public static class Ui
         if (owner?.IsVisible == true) MessageBox.Show(owner, e.Message, Strings.T("Error"), MessageBoxButton.OK, MessageBoxImage.Warning);
         else MessageBox.Show(e.Message, Strings.T("Error"), MessageBoxButton.OK, MessageBoxImage.Warning);
     }
-    public static void Setup(Window window)
+    public static void Setup(Window window, bool setIcon = true)
     {
         window.FontFamily = new FontFamily("Microsoft YaHei UI"); window.FontSize = 12;
-        window.Icon = BrandIcon.Source;
+        if (setIcon) window.Icon = BrandIcon.Source;
         window.SetResourceReference(Window.BackgroundProperty, "SurfaceBrush"); window.SetResourceReference(Window.ForegroundProperty, "TextBrush");
         window.UseLayoutRounding = true; TextOptions.SetTextFormattingMode(window, TextFormattingMode.Display);
+        window.SourceInitialized += (_, _) => Native.ApplyDarkTitleBar(window, IsDark);
     }
     public static void Theme(string value)
     {
         bool dark = value == "Dark";
         if (value == "System") { using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"); dark = key?.GetValue("AppsUseLightTheme") is int n && n == 0; }
+        IsDark = dark;
         var colors = dark
             ? new[] { "#24212B", "#2E2A36", "#F3EFF8", "#AAA2B6", "#443D50", "#393242", "#B49BEF", "#453953", "#1D1A23", "#86C5AE", "#E4B47C", "#7960B7" }
             : new[] { "#F5F3F7", "#FFFFFF", "#302C38", "#68616F", "#E5E0EB", "#F0ECF6", "#7762BA", "#EEE8FA", "#E7E4ED", "#2E725F", "#92531D", "#7762BA" };
         var names = new[] { "SurfaceBrush", "PanelBrush", "TextBrush", "MutedBrush", "BorderBrush", "HoverBrush", "AccentBrush", "AccentSoftBrush", "CanvasBrush", "SuccessBrush", "WarningBrush", "PrimaryBrush" };
-        for (int i = 0; i < names.Length; i++) Application.Current.Resources[names[i]] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(colors[i]));
+        for (int i = 0; i < names.Length; i++)
+        {
+            var brush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(colors[i]));
+            brush.Freeze();
+            Application.Current.Resources[names[i]] = brush;
+        }
+        if (Application.Current?.Windows is { } windows)
+            foreach (Window window in windows) Native.ApplyDarkTitleBar(window, dark);
     }
 }
 
 // Original small line drawings; no external icon assets or fonts required.
 internal static class Icons
 {
+    private static readonly ConcurrentDictionary<string, Geometry> CachedGeometries = new(StringComparer.Ordinal);
     private static readonly Dictionary<string, string> Paths = new()
     {
         ["Capture"] = "M3,7 V3 H7 M13,3 H17 V7 M17,13 V17 H13 M7,17 H3 V13 M6,6 H14 V14 H6 Z",
@@ -133,4 +160,10 @@ internal static class Icons
         ["Folder"] = "M3,5 H8 L10,7 H17 V16 H3 Z", ["Info"] = "M17,10 A7,7 0 1 1 3,10 A7,7 0 1 1 17,10 M10,9 V14 M10,6 V6.2",
     };
     public static string Get(string key) => Paths.GetValueOrDefault(key, Paths["Capture"]);
+    public static Geometry Geometry(string key) => CachedGeometries.GetOrAdd(key, static k =>
+    {
+        var geometry = System.Windows.Media.Geometry.Parse(Get(k));
+        geometry.Freeze();
+        return geometry;
+    });
 }

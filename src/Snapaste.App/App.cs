@@ -53,12 +53,19 @@ public sealed class App : Application
         base.OnStartup(e);
         using var process = System.Diagnostics.Process.GetCurrentProcess();
         var activationPipe = PipeName + "." + process.SessionId;
+        bool quitRequested = e.Args.Any(arg => string.Equals(arg, "--quit", StringComparison.OrdinalIgnoreCase));
         instance = new Mutex(false, MutexName);
         try { ownsInstance = instance.WaitOne(0); }
         catch (AbandonedMutexException) { ownsInstance = true; }
         if (!ownsInstance)
         {
-            if (!TryActivate(activationPipe, 800)) TryActivate(PipeName, 200);
+            byte command = quitRequested ? (byte)'Q' : (byte)'A';
+            if (!TryActivate(activationPipe, 800, command)) TryActivate(PipeName, 200, command);
+            Shutdown();
+            return;
+        }
+        if (quitRequested)
+        {
             Shutdown();
             return;
         }
@@ -82,18 +89,33 @@ public sealed class App : Application
         pins = new PinManager();
         hotkeys = new Hotkeys();
         ConfigureHotkeys();
-        if (Settings.RestorePins) pins.Restore();
-        PruneSessions();
-        _ = TrimHistoryAsync(Settings);
+        if (Settings.RestorePins) _ = pins.RestoreAsync(WaitForCaptureToClose);
+        var sessionCutoff = DateTime.UtcNow;
+        int cacheMegabytes = Settings.HistoryMegabytes;
+        _ = RunDeferredMaintenanceAsync(sessionCutoff, cacheMegabytes, lifetime.Token);
         if (firstRun || e.Args.Contains("--settings")) ShowSettings();
     }
 
-    private static bool TryActivate(string name, int timeout)
+    private async Task RunDeferredMaintenanceAsync(DateTime sessionCutoff, int cacheMegabytes, CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(6000, token).ConfigureAwait(false);
+            PruneSessions(sessionCutoff, cacheMegabytes);
+            await TrimHistoryAsync(Settings).ConfigureAwait(false);
+            await Ocr.OcrService.WarmUpAsync(token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+    }
+
+    private static bool TryActivate(string name, int timeout, byte command = (byte)'A')
     {
         try
         {
             using var pipe = new NamedPipeClientStream(".", name, PipeDirection.Out, PipeOptions.CurrentUserOnly);
             pipe.Connect(timeout);
+            pipe.WriteByte(command);
+            pipe.Flush();
             return true;
         }
         catch (Exception e) when (e is IOException or TimeoutException or UnauthorizedAccessException) { return false; }
@@ -105,9 +127,13 @@ public sealed class App : Application
         {
             try
             {
+                int command;
                 using (var pipe = new NamedPipeServerStream(name, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly))
+                {
                     await pipe.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
-                _ = Dispatcher.BeginInvoke(ShowSettings);
+                    command = pipe.ReadByte();
+                }
+                _ = Dispatcher.BeginInvoke(command == 'Q' ? ExitSafely : ShowSettings);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return; }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -119,18 +145,18 @@ public sealed class App : Application
         }
     }
 
-    private void PruneSessions()
+    private static void PruneSessions(DateTime cutoff, int cacheMegabytes)
     {
         try
         {
             var directories = new DirectoryInfo(Paths.Sessions).EnumerateDirectories()
-                .Where(d => Guid.TryParseExact(d.Name, "N", out _) && (d.Attributes & FileAttributes.ReparsePoint) == 0)
+                .Where(d => Guid.TryParseExact(d.Name, "N", out _) && (d.Attributes & FileAttributes.ReparsePoint) == 0 && d.CreationTimeUtc < cutoff)
                 .OrderBy(d => d.LastWriteTimeUtc)
                 .Select(d => (Directory: d, Bytes: d.EnumerateFiles().Sum(f => f.Length))).ToArray();
             long total = directories.Sum(d => d.Bytes);
             foreach (var (directory, bytes) in directories)
             {
-                if (directory.LastWriteTimeUtc > DateTime.UtcNow.AddDays(-7) && total <= (long)Settings.HistoryMegabytes * 1024 * 1024) continue;
+                if (directory.LastWriteTimeUtc > DateTime.UtcNow.AddDays(-7) && total <= (long)cacheMegabytes * 1024 * 1024) continue;
                 directory.Delete(true);
                 total -= bytes;
             }
@@ -141,12 +167,17 @@ public sealed class App : Application
     private void SetupTray()
     {
         trayMenu = new Forms.ContextMenuStrip();
-        void Add(string key, Action action) => trayMenu.Items.Add(Strings.T(key), null, (_, _) => Dispatcher.BeginInvoke(action));
-        Add("Capture", () => Capture(false)); Add("Scroll", () => Capture(true)); Add("Pin", PinClipboard);
-        Add("History", ShowHistory); trayMenu.Items.Add(new Forms.ToolStripSeparator());
-        Add("ShowPins", ShowPins); Add("HidePins", HidePins); Add("RecoverPins", RecoverPins);
-        Add("ClosePins", () => pins?.CloseAll());
-        Add("Settings", ShowSettings); Add("Exit", ExitSafely);
+        trayMenu.Opening += (_, e) =>
+        {
+            if (trayMenu.Items.Count != 0) return;
+            void Add(string key, Action action) => trayMenu.Items.Add(Strings.T(key), null, (_, _) => Dispatcher.BeginInvoke(action));
+            Add("Capture", () => Capture(false)); Add("Scroll", () => Capture(true)); Add("Pin", PinClipboard);
+            Add("History", ShowHistory); trayMenu.Items.Add(new Forms.ToolStripSeparator());
+            Add("ShowPins", ShowPins); Add("HidePins", HidePins); Add("RecoverPins", RecoverPins);
+            Add("ClosePins", () => pins?.CloseAll());
+            Add("Settings", ShowSettings); Add("Exit", ExitSafely);
+            e.Cancel = false;
+        };
         trayIcon = BrandIcon.Tray();
         tray = new Forms.NotifyIcon { Text = TrayText(), Icon = trayIcon, ContextMenuStrip = trayMenu, Visible = true };
         tray.DoubleClick += (_, _) => Dispatcher.BeginInvoke(() => Capture(false));
@@ -249,16 +280,34 @@ public sealed class App : Application
     private void OnDisplaySettingsChanged(object? sender, EventArgs e)
         => Dispatcher.BeginInvoke(() => pins?.EnsureReachable());
 
+    private async Task WaitForCaptureToClose()
+    {
+        while (((Window?)overlay ?? scrollWindow) is { } active)
+        {
+            var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void OnClosed(object? sender, EventArgs e) => closed.TrySetResult();
+            active.Closed += OnClosed;
+            try { await closed.Task; }
+            finally { active.Closed -= OnClosed; }
+        }
+    }
+
     public void Capture(bool scroll)
     {
         if (exiting || overlay != null || scrollWindow != null) return;
         CaptureOverlay? attempted = null;
+        WindowDetector? prebuiltDetector = null;
         try
         {
             var bounds = Native.Desktop;
+            var uiDispatcher = Dispatcher;
+            var detectorTask = Task.Run(() => new WindowDetector(bounds, uiDispatcher));
             var bitmap = captureProvider.Capture(bounds, Settings.IncludeCursor);
-            var captureOverlay = new CaptureOverlay(bitmap, bounds, Settings, scroll);
+            prebuiltDetector = detectorTask.GetAwaiter().GetResult();
+            var captureOverlay = new CaptureOverlay(bitmap, bounds, Settings, scroll, prebuiltDetector);
+            prebuiltDetector = null;
             overlay = attempted = captureOverlay;
+            _ = Ocr.OcrService.WarmUpAsync(lifetime.Token);
             captureOverlay.Closed += (_, _) => overlay = null;
             captureOverlay.Accepted += async (rect, doc, action, target) =>
             {
@@ -270,10 +319,15 @@ public sealed class App : Application
                         if (target == 0) { var center = new Native.POINT((int)(rect.X + rect.Width / 2), (int)(rect.Y + rect.Height / 2)); target = Native.GetAncestor(Native.WindowFromPoint(center), 2); }
                         if (target != 0) Native.SetForegroundWindow(target);
                         var session = new ScrollSession(rect, target, Settings, captureProvider);
-                        session.Finished += result => Edit(result);
+                        ScrollWindow? window = null;
+                        session.Finished += result =>
+                        {
+                            if (window?.EditRequested == true) Edit(result);
+                            else CompleteScrollDirect(result);
+                        };
                         try
                         {
-                            scrollWindow = new ScrollWindow(session);
+                            scrollWindow = window = new ScrollWindow(session);
                             scrollWindow.Closed += (_, _) => scrollWindow = null;
                             scrollWindow.Show();
                             return true;
@@ -296,6 +350,7 @@ public sealed class App : Application
         }
         catch (Exception e)
         {
+            prebuiltDetector?.Dispose();
             if (overlay == attempted) overlay = null;
             attempted?.Close();
             Log.Error("Capture failure", e);
@@ -306,6 +361,29 @@ public sealed class App : Application
     public void Edit(ImageDocument image, Tool tool = Tool.Select)
     {
         var editor = new EditorWindow(image, tool); editor.PinRequested += PinDocument; editor.Completed += Remember; editor.Show();
+    }
+
+    private async void CompleteScrollDirect(ImageDocument image)
+    {
+        var doc = new EditDocument(image);
+        try
+        {
+            await ImageExport.Copy(doc);
+            Remember(doc);
+        }
+        catch (InvalidOperationException)
+        {
+            try
+            {
+                if (ImageExport.SaveDialog(doc, Settings)) Remember(doc);
+            }
+            catch (Exception e) { Log.Error("Scroll direct save", e); Ui.Error(e); }
+        }
+        catch (Exception e)
+        {
+            Log.Error("Scroll direct copy", e);
+            Ui.Error(e);
+        }
     }
 
     public async void Remember(EditDocument doc)
@@ -357,9 +435,17 @@ public sealed class App : Application
         finally { historyJobs--; historyQueue.Release(); }
     }
 
+    private async Task RunHistoryIoAsync(Action action)
+    {
+        historyJobs++;
+        await historyQueue.WaitAsync();
+        try { await Task.Run(action); }
+        finally { historyJobs--; historyQueue.Release(); }
+    }
+
     public async Task ClearHistoryAsync()
     {
-        await RunHistoryAsync(() => History.Clean(true));
+        await RunHistoryIoAsync(() => History.Clean(true));
         historyWindow?.Reload();
     }
 
@@ -367,8 +453,8 @@ public sealed class App : Application
     {
         try
         {
-            await RunHistoryAsync(() => History.Clean(false, settings));
-            historyWindow?.Reload();
+            await RunHistoryIoAsync(() => History.Clean(false, settings));
+            if (!exiting && historyWindow != null) _ = Dispatcher.BeginInvoke(() => historyWindow?.Reload());
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log.Error("History retention", e); }
     }
@@ -447,6 +533,7 @@ public sealed class App : Application
         SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
         SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         hotkeys?.Dispose();
+        captureProvider.Dispose();
         tray?.Dispose();
         trayMenu?.Dispose();
         trayIcon?.Dispose();

@@ -39,8 +39,17 @@ public sealed class FrameSample
                 int rows = Math.Min(blockHeight, Height - top);
                 gray.CopyPixels(new Int32Rect(0, top, width, rows), pixels, width, 0);
                 for (int y = 0; y < rows; y++)
+                {
+                    int rowOffset = y * width;
                     for (int x = 0; x < Columns; x++)
-                        Gray[(top + y) * Columns + x] = pixels[y * width + sampleColumns[x]];
+                    {
+                        int col = sampleColumns[x];
+                        if (width >= Columns * 3 && col > 0 && col + 1 < width)
+                            Gray[(top + y) * Columns + x] = (byte)((pixels[rowOffset + col - 1] + 2 * pixels[rowOffset + col] + pixels[rowOffset + col + 1] + 2) >> 2);
+                        else
+                            Gray[(top + y) * Columns + x] = pixels[rowOffset + col];
+                    }
+                }
             }
         }
         finally { ArrayPool<byte>.Shared.Return(pixels); }
@@ -136,12 +145,10 @@ public static class ScrollMatcher
 
         var best = refined.Where(candidate => candidate.Offset > 0).MinBy(candidate => candidate.Error);
         double secondError = refined.Where(candidate => candidate.Offset <= 0 || Math.Abs(candidate.Offset - best.Offset) >= 4).Min(candidate => candidate.Error);
-        double neighborError = refined.Where(candidate => candidate.Offset > 0 && candidate.Offset != best.Offset && Math.Abs(candidate.Offset - best.Offset) < 4)
-            .Select(candidate => candidate.Error).DefaultIfEmpty(double.PositiveInfinity).Min();
         double score = Math.Clamp(1 - best.Error / 35, 0, 1), second = Math.Clamp(1 - secondError / 35, 0, 1);
         double uniqueness = Math.Clamp((secondError - best.Error) / Math.Max(1.5, secondError), 0, 1);
         bool reliable = score >= sensitivity && uniqueness >= .20 && best.Texture >= 1.1 &&
-            secondError - best.Error >= .20 && neighborError - best.Error >= .05;
+            secondError - best.Error >= .20;
         var confidence = !reliable ? Confidence.Low : score >= .92 && uniqueness >= .38 ? Confidence.High : Confidence.Medium;
         return new(best.Offset, score, second, uniqueness, best.Texture, confidence, top, bottom);
     }
@@ -200,7 +207,7 @@ public static class ScrollMatcher
             int error = 0, texture = 0;
             for (int y = start; y < end; y += step)
             {
-                for (int x = band * 10; x < band * 10 + 10; x += 2)
+                for (int x = band * 10; x < band * 10 + 10; x++)
                 {
                     int ai = (y + offset) * width + x, bi = y * width + x;
                     int difference = Math.Abs(a.Gray[ai] - b.Gray[bi]);
@@ -209,8 +216,8 @@ public static class ScrollMatcher
                     texture += Math.Min(Math.Abs(da), Math.Abs(db));
                 }
             }
-            errors[band] = error / (rowCount * 25d);
-            totalTexture += texture / (rowCount * 5d);
+            errors[band] = error / (rowCount * 50d);
+            totalTexture += texture / (rowCount * 10d);
         }
         errors.Sort();
         double consistent = 0;

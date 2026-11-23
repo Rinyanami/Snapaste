@@ -1,3 +1,13 @@
+# 0.9.0 性能优化与交互打磨验证（2026-11-19）
+
+- **启动与截图响应（S-1.1 ~ S-1.3）**：`PixelRegionDetector` 单次整图缓冲区读取通过 `PixelRegionQA` 全部样本与双 4K 性能基准；`DesktopCapture` 复用 DIB 缓冲区并通过 `Capture` 并行预热 `WindowDetector`；启动维护任务延迟 6 秒并在后台预热 OCR 引擎，支持 `--quit` 优雅保存贴图并退出；`<SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>` 精简发布目录。
+- **标注、贴图、滚动与 OCR（S-2.1 ~ S-3.10）**：$O(W \cdot H)$ 三遍滑窗模糊与实时马赛克通过 `EditorQA` 旋转遮盖逐像素一致性校验；紧凑文字样式切换按钮（`B`、`I`、`U`、`底`）、智能深浅文字背景、二次贝塞尔平滑笔迹通过 `TextLayoutAudit`（23 项）与 `TextFlowQA`（64 项）；改进后的 `ScrollMatcher` 与快速 `ScrollSession` 通过 `ScrollAudit --cases` 全部匹配与会话回归；OCR 面板具体低置信度行号提示与“复制文字”按钮通过 `OcrUiQA` 明暗主题回归。
+- **构建验证**：`dotnet build Snapaste.sln -c Release -warnaserror` 0 警告、0 错误，生成 `artifacts/Snapaste-0.9.0-win-x64.zip` 与 `artifacts/Snapaste-portable/Snapaste.exe`。
+
+# 0.8.2 截图响应与贴图恢复（2026-11-18）
+
+选区和多屏、标注撤销、文字输入排版三组原有回归共 216 项通过。使用 4 张 2048 × 1024 图片恢复贴图时验证了快捷键消息处理、提前隐藏与关闭，以及退出后的状态恢复。固定色块的内存取图检查覆盖 384,000 个像素。当前测试环境拒绝读取真实桌面，本轮的截图窗口性能数据使用固定 1080p 图像。
+
 # 0.8.1 文字流程实机验收与修复
 
 日期：2026-11-11。用户允许连续操作桌面后，在 Windows 11、1920×1080、单屏 100% DPI 下实际使用鼠标、键盘和本机中文拼音输入法验收。以下记录本轮范围，不替代整个产品的日常稳定性验收。

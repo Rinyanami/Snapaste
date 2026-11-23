@@ -20,10 +20,10 @@ public sealed class Settings
     public bool HistoryEnabled { get; set; } = true;
     public int HistoryCount { get; set; } = 200;
     public int HistoryMegabytes { get; set; } = 1024;
-    public int StableMilliseconds { get; set; } = 600;
+    public int StableMilliseconds { get; set; } = 200;
     public double MatchSensitivity { get; set; } = .78;
     public int MaxScrollFrames { get; set; } = 200;
-    public int AutoScrollDelay { get; set; } = 1000;
+    public int AutoScrollDelay { get; set; } = 420;
     public bool AutoScrollDefault { get; set; }
     public bool ScrollPreview { get; set; } = true;
     public string SaveDirectory { get; set; } = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);

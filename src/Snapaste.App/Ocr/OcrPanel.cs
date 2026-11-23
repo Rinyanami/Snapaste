@@ -15,7 +15,7 @@ public sealed class OcrPanel : Border
     private readonly ComboBox punctuation = new() { MinWidth = 126 };
     private readonly TextBlock status = Ui.Label("", 12), review = Ui.Label("", 11, true);
     private readonly ProgressBar progress = new() { Height = 3, Margin = new Thickness(0, 9, 0, 9) };
-    private readonly Button copy, save, retry, cancel, undo, redo;
+    private readonly Button copyOnly, copy, save, retry, cancel, undo, redo;
     private readonly Expander originalSection;
     private CancellationTokenSource? operation;
     private EditDocument? snapshot;
@@ -73,7 +73,8 @@ public sealed class OcrPanel : Border
         cancel = Ui.Button(Strings.T("OcrStop"), () => operation?.Cancel()); actions.Children.Add(cancel);
         retry = Ui.Tool("Reset", Strings.T("OcrRetry"), () => { if (snapshot != null) _ = RecognizeAsync(snapshot); }); actions.Children.Add(retry);
         save = Ui.Tool("Save", Strings.T("OcrSave"), SaveText); actions.Children.Add(save);
-        copy = Ui.Action("Copy", Strings.T("OcrCopy"), () => _ = CopyAsync(), true, "Ctrl+Enter"); actions.Children.Add(copy);
+        copyOnly = Ui.Button("复制文字", () => _ = CopyAsync(false), "仅复制文字，保留当前窗口"); actions.Children.Add(copyOnly);
+        copy = Ui.Action("Copy", Strings.T("OcrCopy"), () => _ = CopyAsync(true), true, "Ctrl+Enter"); actions.Children.Add(copy);
         Grid.SetRow(actions, 6); layout.Children.Add(actions);
         result.TextChanged += (_, _) => UpdateTextActions();
         punctuation.SelectionChanged += (_, _) => ApplyPunctuation();
@@ -158,9 +159,19 @@ public sealed class OcrPanel : Border
         // The recognized text is the initial document, not a user edit to undo.
         result.IsUndoEnabled = false; result.IsUndoEnabled = true; UpdateTextActions();
         originalSection.Visibility = rawText.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
-        int uncertain = recognized.Lines.Count(line => line.Confidence < .85);
+        var lowIndices = recognized.Lines
+            .Select((line, index) => (line.Confidence, Number: index + 1))
+            .Where(item => item.Confidence < .85)
+            .Select(item => item.Number)
+            .ToArray();
+        int uncertain = lowIndices.Length;
         status.Text = recognized.Lines.Count == 0 ? Strings.T("OcrEmpty") : string.Format(CultureInfo.CurrentCulture, Strings.T("OcrComplete"), recognized.Lines.Count, recognized.ElapsedMilliseconds / 1000d);
-        review.Text = uncertain > 0 ? string.Format(CultureInfo.CurrentCulture, Strings.T("OcrReviewLines"), uncertain) : Strings.T("OcrReviewHint");
+        if (uncertain > 0)
+        {
+            string lineList = string.Join("、", lowIndices.Take(6)) + (lowIndices.Length > 6 ? " 等" : "");
+            review.Text = $"有 {uncertain} 行（第 {lineList} 行）置信度较低，请对照截图核对文字、标点及易混字符。";
+        }
+        else review.Text = Strings.T("OcrReviewHint");
         if (rawText.Length > 0) { result.Focus(); result.CaretIndex = 0; }
     }
 
@@ -185,11 +196,11 @@ public sealed class OcrPanel : Border
     }
     private void UpdateTextActions()
     {
-        copy.IsEnabled = save.IsEnabled = !IsBusy && result.Text.Length > 0;
+        copyOnly.IsEnabled = copy.IsEnabled = save.IsEnabled = !IsBusy && result.Text.Length > 0;
         undo.IsEnabled = !IsBusy && result.CanUndo;
         redo.IsEnabled = !IsBusy && result.CanRedo;
     }
-    private async Task CopyAsync()
+    private async Task CopyAsync(bool complete = true)
     {
         if (IsBusy || result.Text.Length == 0 || dismissed) return;
         string text = result.Text;
@@ -202,7 +213,7 @@ public sealed class OcrPanel : Border
                 catch (System.Runtime.InteropServices.COMException) when (attempt < 4) { await Task.Delay(60); }
             }
             status.Text = Strings.T("OcrCopied");
-            CopyCompleted?.Invoke();
+            if (complete) CopyCompleted?.Invoke();
         }
         catch (Exception error) { status.Text = Strings.T("OcrCopyFailed"); Log.Error("OCR clipboard", error); }
     }

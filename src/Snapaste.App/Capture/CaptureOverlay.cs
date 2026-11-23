@@ -27,20 +27,21 @@ public sealed class CaptureOverlay : Window
     private readonly EditorSurface annotations;
     private readonly Canvas root = new();
     private readonly Border toolbar;
-    private readonly WrapPanel toolbarItems = new() { MaxWidth = 1024 }, options = new();
-    private readonly StackPanel palette = new() { Orientation = Orientation.Horizontal }, sizeOptions = new() { Orientation = Orientation.Horizontal };
-    private readonly WrapPanel textOptions = new();
-    private readonly Slider sizeSlider = new() { Minimum = 2, Maximum = 40, Value = 5, Width = 90, VerticalAlignment = VerticalAlignment.Center };
-    private readonly SelectionActions transforms;
-    private readonly TextBlock sizeLabel = Ui.Label("", 11, true), hint = Ui.Label("", 11, true);
-    private readonly ComboBox font = new() { Width = 155, IsEditable = true, MaxDropDownHeight = 220 }, fontSize = new() { Width = 60, IsEditable = true };
-    private readonly CheckBox bold = new() { Content = Strings.T("Bold"), Margin = new Thickness(6) }, textBackground = new() { Content = Strings.T("Background"), Margin = new Thickness(6) };
-    private readonly CheckBox italic = new() { Content = Strings.T("Italic"), Margin = new Thickness(6) }, underline = new() { Content = Strings.T("Underline"), Margin = new Thickness(6) };
+    private WrapPanel toolbarItems = null!, options = null!, textOptions = null!;
+    private StackPanel palette = null!, sizeOptions = null!;
+    private Slider sizeSlider = null!;
+    private SelectionActions transforms = null!;
+    private TextBlock sizeLabel = null!, sizeValue = null!, hint = null!;
+    private ComboBox font = null!, fontSize = null!;
+    private CheckBox bold = null!, textBackground = null!, italic = null!, underline = null!;
+    private string? toastMessage;
+    private System.Windows.Threading.DispatcherTimer? toastTimer;
     private readonly Dictionary<TextAlignment, Button> alignments = [];
-    private readonly Button indentLess, indentMore;
+    private Button indentLess = null!, indentMore = null!;
     private readonly Dictionary<Tool, Button> tools = [];
     private readonly List<(Color Color, Button Button)> colors = [];
-    private readonly Button undo, redo, delete;
+    private Button undo = null!, redo = null!, delete = null!;
+    private bool toolbarReady, detailsReady;
     private TextBox? textInput;
     private OcrPanel? ocrPanel;
     private Annotation? textOriginal, textDraft;
@@ -59,45 +60,26 @@ public sealed class CaptureOverlay : Window
     public event Func<Rect, EditDocument, string, nint, Task<bool>>? Accepted;
 
     public CaptureOverlay(BitmapSource desktop, Rect screen, Settings settings, bool scroll)
+        : this(desktop, screen, settings, scroll, null) { }
+
+    public CaptureOverlay(BitmapSource desktop, Rect screen, Settings settings, bool scroll, WindowDetector? prebuiltDetector)
     {
         this.desktop = desktop; this.screen = screen; this.settings = settings; scrollMode = scroll;
         monitors = System.Windows.Forms.Screen.AllScreens.Select(m => Rect.Intersect(new Rect(m.Bounds.X, m.Bounds.Y, m.Bounds.Width, m.Bounds.Height), screen))
             .Where(r => !r.IsEmpty && r.Width > 0 && r.Height > 0).ToArray();
         if (monitors.Length == 0) monitors = [screen];
-        detector = new WindowDetector(screen);
+        detector = prebuiltDetector ?? new WindowDetector(screen);
         detector.CandidatesChanged += OnCandidatesChanged;
         Document = new EditDocument(new ImageDocument(desktop));
         detectionMode = settings.UiElements ? 0 : settings.AutoWindow ? 1 : 2;
         Title = "Snapaste · " + Strings.T("Capture"); WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; ShowInTaskbar = false; Topmost = true;
-        Ui.Setup(this); Content = root;
-        surface = new OverlaySurface(this); chrome = new OverlayChrome(this) { IsHitTestVisible = false };
+        Ui.Setup(this, setIcon: false); Content = root;
+        surface = new OverlaySurface(this) { Cursor = Cursors.Cross }; chrome = new OverlayChrome(this) { IsHitTestVisible = false };
         annotations = new EditorSurface(Document) { DrawBaseImage = false, Visibility = Visibility.Collapsed, CurrentTool = Tool.Select };
-        var toolbarContent = new StackPanel(); toolbarContent.Children.Add(toolbarItems); toolbarContent.Children.Add(options);
-        toolbar = Ui.Card(toolbarContent, 5, true); toolbar.Visibility = Visibility.Collapsed;
-        toolbar.SizeChanged += (_, _) => { if (textInput != null && !closed) UpdateTextLayout(); };
+        toolbar = new Border { Visibility = Visibility.Collapsed };
         root.Children.Add(surface); root.Children.Add(annotations); root.Children.Add(chrome); root.Children.Add(toolbar); Panel.SetZIndex(toolbar, 5);
-        foreach (Tool tool in Enum.GetValues<Tool>())
-        {
-            var value = tool; var button = Ui.Tool(tool.ToString(), Strings.T(tool.ToString()), () => SelectTool(value));
-            Compact(button); tools.Add(tool, button); toolbarItems.Children.Add(button);
-        }
-        toolbarItems.Children.Add(Ui.Divider());
-        delete = Ui.Tool("Delete", Strings.T("Delete"), () => { CommitText(); annotations.Delete(); Refresh(); }, "Delete");
-        undo = Ui.Tool("Undo", Strings.T("Undo"), () => History(false), "Ctrl+Z"); redo = Ui.Tool("Redo", Strings.T("Redo"), () => History(true), "Ctrl+Y");
-        foreach (var button in new[] { delete, undo, redo }) { Compact(button); toolbarItems.Children.Add(button); }
-        toolbarItems.Children.Add(Ui.Divider());
-        toolbarItems.Children.Add(Ui.Action("Ocr", Strings.T("Ocr"), ShowOcr, hint: Strings.T("OcrShortcut")));
-        toolbarItems.Children.Add(Ui.Action("Scroll", Strings.T("Scroll"), () => Finish("Scroll")));
-        foreach (var action in new[] { "Pin", "Save", "Cancel" })
-        {
-            var value = action; var button = Ui.Tool(action, Strings.T(action), () => { if (value == "Cancel") Close(); else Finish(value); }); Compact(button); toolbarItems.Children.Add(button);
-        }
-        toolbarItems.Children.Add(Ui.Action("Copy", Strings.T("Copy"), () => Finish("Copy"), true, Strings.T("CopyFinishHint")));
-        transforms = new SelectionActions(annotations, CommitText);
-        indentLess = Ui.Tool("IndentLess", Strings.T("IndentLess"), () => ChangeIndent(-1));
-        indentMore = Ui.Tool("IndentMore", Strings.T("IndentMore"), () => ChangeIndent(1));
-        BuildOptions();
         annotations.Changed += Refresh; annotations.TextRequested += BeginText;
+        annotations.ColorPicked += hex => ShowToast($"已复制 {hex}");
         annotations.EmptySelectionDown += e => { if (e.ClickCount == 2) Finish("Copy"); else BeginDrag(e); e.Handled = true; };
         surface.MouseLeftButtonDown += (_, e) => BeginDrag(e);
         surface.MouseLeftButtonUp += Up; surface.MouseMove += Move;
@@ -144,6 +126,13 @@ public sealed class CaptureOverlay : Window
         SourceInitialized += (_, _) => Native.PlacePhysical(this, screen);
         root.SizeChanged += (_, _) => { surface.Width = chrome.Width = root.ActualWidth; surface.Height = chrome.Height = root.ActualHeight; Refresh(); PositionOcr(); };
         PreviewKeyDown += Key;
+        ContentRendered += (_, _) =>
+        {
+            if (closed || detailsReady) return;
+            detailsReady = true;
+            chrome.InvalidateVisual();
+            if (pointerKnown && selected.IsEmpty && !dragging && detectionMode == 0) RefreshCandidates();
+        };
         Loaded += (_, _) =>
         {
             Activate(); Focus(); pointer = PixelPoint(Native.Cursor); pointerKnown = true;
@@ -151,11 +140,81 @@ public sealed class CaptureOverlay : Window
         };
         Closed += (_, _) =>
         {
-            closed = true; ocrPanel?.Dismiss(); detector.CandidatesChanged -= OnCandidatesChanged; detector.Dispose();
+            closed = true; toastTimer?.Stop(); ocrPanel?.Dismiss(); detector.CandidatesChanged -= OnCandidatesChanged; detector.Dispose();
             detectionLifetime.Cancel();
             if (pixelPreparation == null || pixelPreparation.IsCompleted) detectionLifetime.Dispose();
             else _ = pixelPreparation.ContinueWith(_ => detectionLifetime.Dispose(), TaskScheduler.Default);
         };
+    }
+
+    private void ShowToast(string message)
+    {
+        toastMessage = message;
+        if (toolbarReady && hint != null) hint.Text = message;
+        if (toastTimer == null)
+        {
+            toastTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1400) };
+            toastTimer.Tick += (_, _) =>
+            {
+                toastTimer.Stop();
+                toastMessage = null;
+                if (!closed) chrome.InvalidateVisual();
+            };
+        }
+        toastTimer.Stop();
+        toastTimer.Start();
+        chrome.InvalidateVisual();
+    }
+
+    private void EnsureToolbar()
+    {
+        if (toolbarReady) return;
+        toolbarItems = new WrapPanel { MaxWidth = 1024 };
+        options = new WrapPanel();
+        textOptions = new WrapPanel();
+        palette = new StackPanel { Orientation = Orientation.Horizontal };
+        sizeOptions = new StackPanel { Orientation = Orientation.Horizontal };
+        sizeSlider = new Slider { Minimum = 2, Maximum = 40, Value = 5, Width = 90, VerticalAlignment = VerticalAlignment.Center };
+        sizeLabel = Ui.Label("", 11, true);
+        sizeValue = Ui.Label("5 px", 11, true);
+        hint = Ui.Label("", 11, true);
+        font = new ComboBox { Width = 148, IsEditable = true, MaxDropDownHeight = 220 };
+        fontSize = new ComboBox { Width = 58, IsEditable = true };
+        bold = new CheckBox();
+        italic = new CheckBox();
+        underline = new CheckBox();
+        textBackground = new CheckBox();
+        EditorWindow.ConfigureStyleToggle(bold, "B", Strings.T("Bold"), FontWeights.Bold, FontStyles.Normal, false, "Ctrl+B");
+        EditorWindow.ConfigureStyleToggle(italic, "I", Strings.T("Italic"), FontWeights.Normal, FontStyles.Italic, false, "Ctrl+I");
+        EditorWindow.ConfigureStyleToggle(underline, "U", Strings.T("Underline"), FontWeights.Normal, FontStyles.Normal, true, "Ctrl+U");
+        EditorWindow.ConfigureStyleToggle(textBackground, "底", Strings.T("Background"), FontWeights.SemiBold, FontStyles.Normal, false);
+        var content = new StackPanel();
+        content.Children.Add(toolbarItems);
+        content.Children.Add(options);
+        toolbar.Child = Ui.Card(content, 5, true);
+        toolbar.SizeChanged += (_, _) => { if (textInput != null && !closed) UpdateTextLayout(); };
+        foreach (Tool tool in Enum.GetValues<Tool>())
+        {
+            var value = tool; var button = Ui.Tool(tool.ToString(), Strings.T(tool.ToString()), () => SelectTool(value));
+            Compact(button); tools.Add(tool, button); toolbarItems.Children.Add(button);
+        }
+        toolbarItems.Children.Add(Ui.Divider());
+        delete = Ui.Tool("Delete", Strings.T("Delete"), () => { CommitText(); annotations.Delete(); Refresh(); }, "Delete");
+        undo = Ui.Tool("Undo", Strings.T("Undo"), () => History(false), "Ctrl+Z"); redo = Ui.Tool("Redo", Strings.T("Redo"), () => History(true), "Ctrl+Y");
+        foreach (var button in new[] { delete, undo, redo }) { Compact(button); toolbarItems.Children.Add(button); }
+        toolbarItems.Children.Add(Ui.Divider());
+        toolbarItems.Children.Add(Ui.Action("Ocr", Strings.T("Ocr"), ShowOcr, hint: Strings.T("OcrShortcut")));
+        toolbarItems.Children.Add(Ui.Action("Scroll", Strings.T("Scroll"), () => Finish("Scroll")));
+        foreach (var action in new[] { "Pin", "Save", "Cancel" })
+        {
+            var value = action; var button = Ui.Tool(action, Strings.T(action), () => { if (value == "Cancel") Close(); else Finish(value); }); Compact(button); toolbarItems.Children.Add(button);
+        }
+        toolbarItems.Children.Add(Ui.Action("Copy", Strings.T("Copy"), () => Finish("Copy"), true, Strings.T("CopyFinishHint")));
+        transforms = new SelectionActions(annotations, CommitText);
+        indentLess = Ui.Tool("IndentLess", Strings.T("IndentLess"), () => ChangeIndent(-1));
+        indentMore = Ui.Tool("IndentMore", Strings.T("IndentMore"), () => ChangeIndent(1));
+        BuildOptions();
+        toolbarReady = true;
     }
 
     private static void Compact(Button b) { b.Width = b.Height = b.MinHeight = 32; b.Padding = new Thickness(6); b.Margin = new Thickness(1); }
@@ -184,9 +243,11 @@ public sealed class CaptureOverlay : Window
             b.Width = b.Height = b.MinHeight = 24; b.Padding = new Thickness(4); b.Margin = new Thickness(1); colors.Add((color, b)); palette.Children.Add(b);
         }
         sizeLabel.Margin = new Thickness(10, 0, 5, 0); sizeLabel.VerticalAlignment = VerticalAlignment.Center; sizeOptions.Children.Add(sizeLabel);
-        sizeSlider.ValueChanged += (_, _) => { if (!updatingTextOptions) annotations.SetSize(sizeSlider.Value); }; sizeOptions.Children.Add(sizeSlider);
+        sizeValue.Width = 32; sizeValue.Margin = new Thickness(4, 0, 0, 0); sizeValue.VerticalAlignment = VerticalAlignment.Center;
+        sizeSlider.ValueChanged += (_, _) => { sizeValue.Text = $"{Math.Round(sizeSlider.Value):0} px"; if (!updatingTextOptions) annotations.SetSize(sizeSlider.Value); };
+        sizeOptions.Children.Add(sizeSlider); sizeOptions.Children.Add(sizeValue);
         sizeSlider.PreviewMouseLeftButtonDown += (_, _) => annotations.BeginStyleEdit(); sizeSlider.PreviewMouseLeftButtonUp += (_, _) => annotations.EndStyleEdit(); sizeSlider.LostMouseCapture += (_, _) => annotations.EndStyleEdit();
-        font.ItemsSource = Fonts.SystemFontFamilies.Select(f => f.Source).Order().ToList(); font.Text = annotations.TextFont;
+        Ui.LoadFontsOnOpen(font); font.Text = annotations.TextFont;
         fontSize.ItemsSource = new[] { "12", "16", "20", "24", "32", "48", "64", "96" }; fontSize.Text = "24";
         foreach (var control in new FrameworkElement[] { font, fontSize, bold, italic, underline, textBackground }) textOptions.Children.Add(control);
         foreach (var (alignment, key) in new[] { (TextAlignment.Left, "AlignLeft"), (TextAlignment.Center, "AlignCenter"), (TextAlignment.Right, "AlignRight") })
@@ -213,7 +274,6 @@ public sealed class CaptureOverlay : Window
         System.Windows.Automation.AutomationProperties.SetName(font, Strings.T("Font"));
         System.Windows.Automation.AutomationProperties.SetName(fontSize, Strings.T("FontSize"));
         fontSize.ToolTip = Strings.T("FontSize") + " · 8–300";
-        bold.ToolTip = Strings.T("Bold") + " · Ctrl+B"; italic.ToolTip = Strings.T("Italic") + " · Ctrl+I"; underline.ToolTip = Strings.T("Underline") + " · Ctrl+U";
         foreach (var control in new[] { bold, italic, underline, textBackground })
         {
             void Changed(object sender, RoutedEventArgs e) { if (updatingTextOptions) return; ApplyTextOptions(); RestoreTextFocus(); }
@@ -281,8 +341,9 @@ public sealed class CaptureOverlay : Window
         if (closed || dragging || !selected.IsEmpty || !pointerKnown) return;
         candidates.Clear(); candidateIndex = 0; candidate = Rect.Empty; candidateTarget = 0;
         if (detectionMode == 2) { preferredCandidate = null; RefreshVisuals(); return; }
-        if (detectionMode == 0 && pixelPreparation == null) pixelPreparation = PreparePixelDetection();
-        var detected = detector.Candidates(pointer, detectionMode == 0);
+        bool detectDetails = detailsReady || PresentationSource.FromVisual(this) == null;
+        if (detectionMode == 0 && detectDetails && pixelPreparation == null) pixelPreparation = PreparePixelDetection();
+        var detected = detector.Candidates(pointer, detectionMode == 0 && detectDetails);
         var owner = detected.LastOrDefault(value => value.IsWindow);
         void Add(Rect bounds, nint handle, string kind)
         {
@@ -443,14 +504,23 @@ public sealed class CaptureOverlay : Window
             if (next != selected) target = 0;
             selected = next;
         }
-        PlaceAnnotations(); RefreshVisuals(); UpdateOptions(); if (!dragging) PositionToolbar();
+        PlaceAnnotations();
+        RefreshVisuals();
+        if (selected.IsEmpty || dragging) return;
+        EnsureToolbar();
+        UpdateOptions();
+        PositionToolbar();
     }
     private void PositionToolbar()
     {
         if (selected.IsEmpty || ocrPanel != null) return;
         var area = MonitorArea(PixelPoint(selected.BottomRight - new Vector(1, 1)));
         double width = area.Width;
-        toolbar.Visibility = Visibility.Visible; toolbarItems.MaxWidth = options.MaxWidth = Math.Max(150, Math.Min(1024, width - 24));
+        double max = Math.Max(150, Math.Min(1024, width - 24));
+        toolbar.Visibility = Visibility.Visible;
+        toolbarItems.MaxWidth = max;
+        toolbarItems.Measure(new Size(max, Math.Max(200, area.Height)));
+        options.MaxWidth = Math.Max(150, Math.Min(max, toolbarItems.DesiredSize.Width - 10));
         textOptions.MaxWidth = Math.Max(150, Math.Min(1000, width - 40));
         toolbar.Measure(new Size(Math.Max(150, width - 12), Math.Max(200, area.Height))); var size = toolbar.DesiredSize; var r = Local(selected);
         Canvas.SetLeft(toolbar, Math.Clamp(r.Right - size.Width, area.Left + 6, Math.Max(area.Left + 6, area.Right - size.Width - 6)));
@@ -569,7 +639,19 @@ public sealed class CaptureOverlay : Window
         {
             CycleCandidate(e.Key == System.Windows.Input.Key.PageUp ? -1 : 1); e.Handled = true; return;
         }
-        if (e.Key == System.Windows.Input.Key.C && Keyboard.Modifiers == ModifierKeys.None) { try { var c = PixelColor(pointer); Clipboard.SetText($"#{c.R:X2}{c.G:X2}{c.B:X2}"); } catch (Exception ex) { Ui.Error(ex, this); } e.Handled = true; return; }
+        if (e.Key == System.Windows.Input.Key.C && (Keyboard.Modifiers == ModifierKeys.None || Keyboard.Modifiers == ModifierKeys.Shift))
+        {
+            try
+            {
+                var c = PixelColor(pointer);
+                var text = Keyboard.Modifiers == ModifierKeys.Shift ? $"rgb({c.R}, {c.G}, {c.B})" : $"#{c.R:X2}{c.G:X2}{c.B:X2}";
+                Clipboard.SetText(text);
+                ShowToast($"已复制 {text}");
+            }
+            catch (Exception ex) { Ui.Error(ex, this); }
+            e.Handled = true;
+            return;
+        }
         if (selected.IsEmpty) return;
         bool control = Keyboard.Modifiers.HasFlag(ModifierKeys.Control);
         if (control && Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) && e.Key == System.Windows.Input.Key.O) { ShowOcr(); e.Handled = true; }
@@ -653,7 +735,7 @@ public sealed class CaptureOverlay : Window
         textInput.TextWrapping = wrap ? TextWrapping.Wrap : TextWrapping.NoWrap;
         if (textInput.Foreground is not SolidColorBrush ink || ink.Color != textDraft.Color)
             textInput.Foreground = new SolidColorBrush(textDraft.Color);
-        var background = textDraft.Background ? Color.FromArgb(230, 255, 255, 255) : Colors.Transparent;
+        var background = textDraft.Background ? Annotation.TextBackgroundColor(textDraft.Color) : Colors.Transparent;
         if (textInput.Background is not SolidColorBrush fill || fill.Color != background)
             textInput.Background = new SolidColorBrush(background);
         var origin = Local(new Point(textDraft.Bounds.X + screen.X, textDraft.Bounds.Y + screen.Y));
@@ -823,13 +905,18 @@ public sealed class CaptureOverlay : Window
     }
     private sealed class OverlaySurface(CaptureOverlay o) : FrameworkElement
     {
+        private static readonly Brush Shade = new SolidColorBrush(Color.FromArgb(88, 0, 0, 0));
         protected override void OnRender(DrawingContext dc)
         {
             dc.DrawImage(o.desktop, o.Local(o.screen));
             var selection = o.selected.IsEmpty ? o.candidate : o.selected;
-            var full = new RectangleGeometry(new Rect(0, 0, ActualWidth, ActualHeight));
-            Geometry shade = selection.IsEmpty ? full : Geometry.Combine(full, new RectangleGeometry(o.Local(selection)), GeometryCombineMode.Exclude, null);
-            dc.DrawGeometry(new SolidColorBrush(Color.FromArgb(88, 0, 0, 0)), null, shade);
+            var full = new Rect(0, 0, ActualWidth, ActualHeight);
+            var cut = selection.IsEmpty ? Rect.Empty : Rect.Intersect(full, o.Local(selection));
+            if (cut.IsEmpty) { dc.DrawRectangle(Shade, null, full); return; }
+            dc.DrawRectangle(Shade, null, new Rect(0, 0, full.Width, cut.Top));
+            dc.DrawRectangle(Shade, null, new Rect(0, cut.Bottom, full.Width, full.Height - cut.Bottom));
+            dc.DrawRectangle(Shade, null, new Rect(0, cut.Top, cut.Left, cut.Height));
+            dc.DrawRectangle(Shade, null, new Rect(cut.Right, cut.Top, full.Width - cut.Right, cut.Height));
         }
     }
     private sealed class OverlayChrome(CaptureOverlay o) : FrameworkElement
@@ -842,6 +929,7 @@ public sealed class CaptureOverlay : Window
         protected override void OnRender(DrawingContext dc)
         {
             var selection = o.selected.IsEmpty ? o.candidate : o.selected;
+            bool basicFrame = !o.detailsReady && PresentationSource.FromVisual(this) != null;
             if (!selection.IsEmpty)
             {
                 var r = o.Local(selection);
@@ -850,6 +938,7 @@ public sealed class CaptureOverlay : Window
                 dc.DrawRectangle(null, new System.Windows.Media.Pen(Ui.Accent, thickness), r);
                 if (!o.selected.IsEmpty)
                     foreach (var p in Handles(r)) dc.DrawRectangle(Brushes.White, new System.Windows.Media.Pen(Ui.Accent, 1.5), new Rect(p.X - 3.5, p.Y - 3.5, 7, 7));
+                if (basicFrame) return;
                 var badgeArea = o.MonitorArea(o.PixelPoint(selection.TopLeft));
                 string size = string.Format(CultureInfo.CurrentCulture, Strings.T("PixelDimensions"), selection.Width, selection.Height);
                 Label(dc, size, new Point(r.Left, r.Top - 31), 14, badgeArea, true);
@@ -859,6 +948,7 @@ public sealed class CaptureOverlay : Window
                     Label(dc, detail, new Point(r.Left, r.Bottom + 8), 11, badgeArea);
                 }
             }
+            if (basicFrame) return;
             if (o.selected.IsEmpty)
             {
                 var area = o.MonitorArea(o.pointer);
@@ -869,6 +959,12 @@ public sealed class CaptureOverlay : Window
             bool inspecting = o.selected.IsEmpty || o.dragging || o.annotations.CurrentTool == Tool.Color || o.annotations.CurrentTool == Tool.Select && o.Hit(o.pointer) >= 0;
             if (o.settings.Magnifier && inspecting && o.pointerKnown && (o.IsMouseOver || o.selected.IsEmpty) &&
                 !o.exporting && o.ocrPanel == null && o.textInput == null && !Within(Mouse.DirectlyOver, o.toolbar)) DrawMagnifier(dc, selection);
+            if (!string.IsNullOrEmpty(o.toastMessage))
+            {
+                var toastArea = o.MonitorArea(o.pointerKnown ? o.pointer : o.screen.TopLeft);
+                var toastPos = o.pointerKnown ? o.Local(o.pointer) + new Vector(18, -36) : new Point(toastArea.Left + 24, toastArea.Top + 24);
+                Label(dc, o.toastMessage, toastPos, 12.5, toastArea, true);
+            }
         }
         private void DrawMagnifier(DrawingContext dc, Rect selection)
         {

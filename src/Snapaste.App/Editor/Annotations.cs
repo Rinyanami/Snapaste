@@ -30,7 +30,14 @@ public sealed class Annotation
     private int effectSize;
     private bool effectPreview, effectBusy;
     private (Rect Area, int Size)? failedPreview;
+    private const int MaxSyncEffectPixels = 4_000_000;
     private static readonly SemaphoreSlim PreviewWorkers = new(1, 1);
+
+    public static Color TextBackgroundColor(Color ink)
+    {
+        double luminance = (0.2126 * ink.R + 0.7152 * ink.G + 0.0722 * ink.B) / 255.0;
+        return luminance > 0.7 ? Color.FromArgb(230, 36, 33, 43) : Color.FromArgb(230, 255, 255, 255);
+    }
     public Annotation Clone() => new()
     {
         Id = Id, Kind = Kind, Bounds = Bounds, Points = [.. Points], Color = Color, Stroke = Stroke,
@@ -162,11 +169,34 @@ public sealed class Annotation
             case Tool.Pen:
             case Tool.Highlighter:
                 if (Points.Count < 2) break;
-                if (Kind == Tool.Highlighter) { brush = new SolidColorBrush(Color) { Opacity = .32 }; pen = new(brush, Stroke * 5) { StartLineCap = PenLineCap.Square, EndLineCap = PenLineCap.Square }; }
-                var geometry = new StreamGeometry(); using (var c = geometry.Open()) { c.BeginFigure(Points[0], false, false); c.PolyLineTo(Points.Skip(1).ToList(), true, false); } dc.DrawGeometry(null, pen, geometry); break;
+                if (Kind == Tool.Highlighter) { brush = new SolidColorBrush(Color) { Opacity = .32 }; pen = new(brush, Stroke * 5) { StartLineCap = PenLineCap.Square, EndLineCap = PenLineCap.Square, LineJoin = PenLineJoin.Round }; }
+                var geometry = new StreamGeometry();
+                using (var c = geometry.Open())
+                {
+                    c.BeginFigure(Points[0], false, false);
+                    if (Points.Count == 2) c.LineTo(Points[1], true, false);
+                    else
+                    {
+                        var bezier = new List<Point>((Points.Count - 2) * 2);
+                        for (int i = 1; i < Points.Count - 1; i++)
+                        {
+                            bezier.Add(Points[i]);
+                            bezier.Add(new Point((Points[i].X + Points[i + 1].X) * 0.5, (Points[i].Y + Points[i + 1].Y) * 0.5));
+                        }
+                        c.PolyQuadraticBezierTo(bezier, true, true);
+                        c.LineTo(Points[^1], true, true);
+                    }
+                }
+                geometry.Freeze();
+                dc.DrawGeometry(null, pen, geometry); break;
             case Tool.Text:
                 var text = FormatText(brush);
-                if (Background) dc.DrawRectangle(new SolidColorBrush(Colors.White) { Opacity = .9 }, null, Bounds);
+                if (Background)
+                {
+                    var bgRect = Bounds;
+                    bgRect.Inflate(4, 2);
+                    dc.DrawRoundedRectangle(new SolidColorBrush(TextBackgroundColor(Color)), null, bgRect, 4, 4);
+                }
                 dc.DrawText(text, new Point(Bounds.X + TextInset, Bounds.Y)); break;
         }
         dc.Pop();
@@ -178,10 +208,12 @@ public sealed class Annotation
         var area = Rect.Intersect(VisualBounds, image.Bounds);
         if (area.IsEmpty || area.Width < 1 || area.Height < 1) return;
         bool valid = effect != null && effectBounds == area && effectSize == EffectSize;
-        if (previewReady == null && (!valid || effectPreview))
+        if ((previewReady == null || area.Width * area.Height <= MaxSyncEffectPixels) && (!valid || (previewReady == null && effectPreview)))
         {
+            bool notify = !valid && previewReady != null;
             effect = Effects.Apply(image.Raster(area), Kind == Tool.Mosaic, EffectSize);
-            effectBounds = area; effectSize = EffectSize; effectPreview = false; valid = true;
+            effectBounds = area; effectSize = EffectSize; effectPreview = false; failedPreview = null; valid = true;
+            if (notify) previewReady?.Invoke();
         }
         else if (!valid && !effectBusy && failedPreview != (area, EffectSize) && previewReady != null)
             _ = PreparePreview(image, area, EffectSize, previewReady);
@@ -255,29 +287,60 @@ public static class Effects
         }
         else
         {
-            int radius = Math.Min(30, size); double sigma = Math.Max(1, radius / 2.5); var kernel = new double[radius * 2 + 1]; double total = 0;
-            for (int k = -radius; k <= radius; k++) total += kernel[k + radius] = Math.Exp(-k * k / (2 * sigma * sigma));
-            for (int k = 0; k < kernel.Length; k++) kernel[k] /= total;
+            int radius = Math.Max(1, (int)Math.Round(Math.Min(30, size) / 2.5));
+            int window = radius * 2 + 1, half = window / 2;
             var temp = new byte[data.Length];
-            Parallel.For(0, h, y =>
+            for (int pass = 0; pass < 3; pass++)
             {
-                int row = y * stride;
-                for (int x = 0; x < w; x++)
+                Parallel.For(0, h, y =>
                 {
-                    double b = 0, g = 0, r = 0, a = 0;
-                    for (int k = -radius; k <= radius; k++) { int p = row + Math.Clamp(x + k, 0, w - 1) * 4; double weight = kernel[k + radius]; b += data[p] * weight; g += data[p + 1] * weight; r += data[p + 2] * weight; a += data[p + 3] * weight; }
-                    int q = row + x * 4; temp[q] = (byte)b; temp[q + 1] = (byte)g; temp[q + 2] = (byte)r; temp[q + 3] = (byte)a;
-                }
-            });
-            Parallel.For(0, h, y =>
-            {
-                for (int x = 0; x < w; x++)
+                    int row = y * stride;
+                    int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+                    for (int k = -radius; k <= radius; k++)
+                    {
+                        int p = row + Math.Clamp(k, 0, w - 1) * 4;
+                        sumB += data[p]; sumG += data[p + 1]; sumR += data[p + 2]; sumA += data[p + 3];
+                    }
+                    for (int x = 0; x < w; x++)
+                    {
+                        int q = row + x * 4;
+                        temp[q] = (byte)((sumB + half) / window);
+                        temp[q + 1] = (byte)((sumG + half) / window);
+                        temp[q + 2] = (byte)((sumR + half) / window);
+                        temp[q + 3] = (byte)((sumA + half) / window);
+                        int left = row + Math.Max(0, x - radius) * 4;
+                        int right = row + Math.Min(w - 1, x + radius + 1) * 4;
+                        sumB += data[right] - data[left];
+                        sumG += data[right + 1] - data[left + 1];
+                        sumR += data[right + 2] - data[left + 2];
+                        sumA += data[right + 3] - data[left + 3];
+                    }
+                });
+                Parallel.For(0, w, x =>
                 {
-                    double b = 0, g = 0, r = 0, a = 0;
-                    for (int k = -radius; k <= radius; k++) { int p = Math.Clamp(y + k, 0, h - 1) * stride + x * 4; double weight = kernel[k + radius]; b += temp[p] * weight; g += temp[p + 1] * weight; r += temp[p + 2] * weight; a += temp[p + 3] * weight; }
-                    int q = y * stride + x * 4; data[q] = (byte)b; data[q + 1] = (byte)g; data[q + 2] = (byte)r; data[q + 3] = (byte)a;
-                }
-            });
+                    int col = x * 4;
+                    int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+                    for (int k = -radius; k <= radius; k++)
+                    {
+                        int p = Math.Clamp(k, 0, h - 1) * stride + col;
+                        sumB += temp[p]; sumG += temp[p + 1]; sumR += temp[p + 2]; sumA += temp[p + 3];
+                    }
+                    for (int y = 0; y < h; y++)
+                    {
+                        int q = y * stride + col;
+                        data[q] = (byte)((sumB + half) / window);
+                        data[q + 1] = (byte)((sumG + half) / window);
+                        data[q + 2] = (byte)((sumR + half) / window);
+                        data[q + 3] = (byte)((sumA + half) / window);
+                        int top = Math.Max(0, y - radius) * stride + col;
+                        int bottom = Math.Min(h - 1, y + radius + 1) * stride + col;
+                        sumB += temp[bottom] - temp[top];
+                        sumG += temp[bottom + 1] - temp[top + 1];
+                        sumR += temp[bottom + 2] - temp[top + 2];
+                        sumA += temp[bottom + 3] - temp[top + 3];
+                    }
+                });
+            }
         }
         var result = BitmapSource.Create(w, h, 96, 96, PixelFormats.Pbgra32, null, data, stride); result.Freeze(); return result;
     }

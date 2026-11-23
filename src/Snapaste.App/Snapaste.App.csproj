@@ -7,9 +7,13 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationIcon>Assets/Brand/App.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>Snapaste</AssemblyName>
-    <Version>0.8.1</Version>
+    <Version>0.9.0</Version>
+    <AssemblyVersion>0.9.0.0</AssemblyVersion>
+    <FileVersion>0.9.0.0</FileVersion>
+    <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
     <PlatformTarget>x64</PlatformTarget>
     <StartupObject>Snapaste.App</StartupObject>
     <!-- WPF owns DPI via the manifest. WinForms is used only for NotifyIcon. -->
@@ -28,4 +32,9 @@
     <Error Condition="!Exists('%(OcrModel.Identity)')" Text="Missing OCR model %(OcrModel.Identity). Run scripts/Get-OcrModels.ps1 before building." />
     <Error Condition="!Exists('%(OcrRuntime.Identity)')" Text="Missing OCR runtime %(OcrRuntime.Identity). Run scripts/Get-OcrModels.ps1 before building." />
   </Target>
+  <ItemGroup>
+    <Resource Include="Assets/Brand/App.ico" />
+    <None Update="Assets/Brand/Logo.png" CopyToPublishDirectory="PreserveNewest" />
+    <None Update="Assets/Brand/App.ico" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

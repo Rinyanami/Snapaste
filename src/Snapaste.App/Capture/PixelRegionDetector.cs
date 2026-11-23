@@ -106,41 +106,43 @@ public sealed class PixelRegionDetector
             source = new FormatConvertedBitmap(source, PixelFormats.Bgra32, null, 0);
             source.Freeze();
         }
-        var colors = Sample(source, step, sampleWidth, sampleHeight, token);
-        var horizontal = Scan(source, colors, step, sampleWidth, sampleHeight, true, token);
-        var vertical = Scan(source, colors, step, sampleWidth, sampleHeight, false, token);
+        token.ThrowIfCancellationRequested();
+        var allPixels = new int[checked(width * height)];
+        source.CopyPixels(allPixels, checked(width * 4), 0);
+        var colors = Sample(allPixels, width, height, step, sampleWidth, sampleHeight, token);
+        var horizontal = Scan(allPixels, width, height, colors, step, sampleWidth, sampleHeight, true, token);
+        var vertical = Scan(allPixels, width, height, colors, step, sampleWidth, sampleHeight, false, token);
         return new(screen, step, sampleWidth, colors, MakeBins(horizontal, width), MakeBins(vertical, height));
     }
 
-    private static int[] Sample(BitmapSource source, int step, int width, int height, CancellationToken token)
+    private static int[] Sample(int[] allPixels, int nativeWidth, int nativeHeight, int step, int width, int height, CancellationToken token)
     {
-        var colors = new int[checked(width * height)];
         if (step == 1)
         {
             token.ThrowIfCancellationRequested();
-            source.CopyPixels(colors, checked(width * 4), 0);
-            return colors;
+            return allPixels;
         }
 
-        int nativeWidth = source.PixelWidth, nativeHeight = source.PixelHeight;
-        var rows = new int[checked(nativeWidth * step)];
+        var colors = new int[checked(width * height)];
         for (int sy = 0; sy < height; sy++)
         {
             token.ThrowIfCancellationRequested();
             int y = sy * step, rowCount = Math.Min(step, nativeHeight - y);
-            source.CopyPixels(new Int32Rect(0, y, nativeWidth, rowCount), rows, checked(nativeWidth * 4), 0);
             for (int sx = 0; sx < width; sx++)
             {
                 int x = sx * step, columnCount = Math.Min(step, nativeWidth - x);
                 int red = 0, green = 0, blue = 0;
                 for (int dy = 0; dy < rowCount; dy++)
+                {
+                    int rowOffset = (y + dy) * nativeWidth + x;
                     for (int dx = 0; dx < columnCount; dx++)
                     {
-                        int pixel = rows[dy * nativeWidth + x + dx];
+                        int pixel = allPixels[rowOffset + dx];
                         red += Red(pixel);
                         green += Green(pixel);
                         blue += Blue(pixel);
                     }
+                }
                 int count = columnCount * rowCount;
                 colors[sy * width + sx] = (red / count << 16) | (green / count << 8) | (blue / count);
             }
@@ -148,11 +150,11 @@ public sealed class PixelRegionDetector
         return colors;
     }
 
-    private static List<Edge> Scan(BitmapSource source, int[] colors, int step, int width, int height, bool horizontal, CancellationToken token)
+    private static List<Edge> Scan(int[] allPixels, int nativeWidth, int nativeHeight, int[] colors, int step, int width, int height, bool horizontal, CancellationToken token)
     {
         int lineCount = horizontal ? height : width, lineLength = horizontal ? width : height;
         int alongStride = horizontal ? 1 : width, normalStride = horizontal ? width : 1;
-        int nativeLength = horizontal ? source.PixelWidth : source.PixelHeight;
+        int nativeLength = horizontal ? nativeWidth : nativeHeight;
         int minRun = Math.Max(5, (MinEdgeLength + step - 1) / step), maxGap = Math.Max(1, 4 / step);
         int sampleContrast = Math.Max(3, MinContrast / step);
         var result = new List<Edge>();
@@ -182,7 +184,7 @@ public sealed class PixelRegionDetector
                 if (start >= 0 && count >= minRun && count * 5 >= (last - start + 1) * 4)
                 {
                     var edge = new Edge(line * step, start * step, Math.Min(nativeLength, (last + 1) * step), before, after);
-                    int refined = step == 1 ? edge.Position : Refine(source, edge, step, horizontal, probes, votes, strengths);
+                    int refined = step == 1 ? edge.Position : Refine(allPixels, nativeWidth, nativeHeight, edge, step, horizontal, probes, votes, strengths);
                     if (refined >= 0) result.Add(edge with { Position = refined });
                     if (result.Count > MaxEdges) return [];
                 }
@@ -198,10 +200,10 @@ public sealed class PixelRegionDetector
         return result;
     }
 
-    private static int Refine(BitmapSource source, Edge edge, int step, bool horizontal, int[] probes, int[] votes, int[] strengths)
+    private static int Refine(int[] allPixels, int nativeWidth, int nativeHeight, Edge edge, int step, bool horizontal, int[] probes, int[] votes, int[] strengths)
     {
         const int probeCount = 7;
-        int nativeSize = horizontal ? source.PixelHeight : source.PixelWidth;
+        int nativeSize = horizontal ? nativeHeight : nativeWidth;
         int first = Math.Max(1, edge.Position - step), last = Math.Min(nativeSize - 1, edge.Position + step);
         int count = last - first + 2;
         Array.Clear(votes);
@@ -209,8 +211,16 @@ public sealed class PixelRegionDetector
         for (int sample = 0; sample < probeCount; sample++)
         {
             int along = edge.Start + (int)((long)(edge.End - edge.Start) * (sample + 1) / (probeCount + 1));
-            var strip = horizontal ? new Int32Rect(along, first - 1, 1, count) : new Int32Rect(first - 1, along, count, 1);
-            source.CopyPixels(strip, probes, horizontal ? 4 : count * 4, 0);
+            if (horizontal)
+            {
+                int index = (first - 1) * nativeWidth + along;
+                for (int i = 0; i < count; i++, index += nativeWidth) probes[i] = allPixels[index];
+            }
+            else
+            {
+                int index = along * nativeWidth + (first - 1);
+                for (int i = 0; i < count; i++) probes[i] = allPixels[index + i];
+            }
             for (int i = 0; i < count - 1; i++)
             {
                 int contrast = Difference(probes[i], probes[i + 1]);

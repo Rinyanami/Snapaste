@@ -39,6 +39,7 @@ public sealed class EditorSurface : FrameworkElement
     public event Action? Changed;
     public event Action<Annotation, bool>? TextRequested;
     public event Action<MouseButtonEventArgs>? EmptySelectionDown;
+    public event Action<string>? ColorPicked;
     public EditorSurface(EditDocument document)
     {
         this.document = document; Focusable = true;
@@ -152,7 +153,11 @@ public sealed class EditorSurface : FrameworkElement
         if (CurrentTool == Tool.Color)
         {
             var p = Clamp(point); var b = document.Raster(new Rect(Math.Clamp((int)p.X, 0, document.Image.Width - 1), Math.Clamp((int)p.Y, 0, document.Image.Height - 1), 1, 1)); var bytes = new byte[4]; b.CopyPixels(bytes, 4, 0);
-            SetColor(Color.FromRgb(bytes[2], bytes[1], bytes[0])); Clipboard.SetText($"#{Ink.R:X2}{Ink.G:X2}{Ink.B:X2}"); return false;
+            SetColor(Color.FromRgb(bytes[2], bytes[1], bytes[0]));
+            var hex = $"#{Ink.R:X2}{Ink.G:X2}{Ink.B:X2}";
+            Clipboard.SetText(hex);
+            ColorPicked?.Invoke(hex);
+            return false;
         }
         // At small sizes all of a text object may be within its resize handles.
         // A deliberate double-click must still reach its editable contents.
@@ -225,7 +230,7 @@ public sealed class EditorSurface : FrameworkElement
         }
         if (a.Kind is Tool.Pen or Tool.Highlighter)
         {
-            if (a.Points[^1] != end) a.Points.Add(end);
+            if ((end - a.Points[^1]).LengthSquared >= 2.25) a.Points.Add(end);
             bounds.Union(a.Bounds); a.Bounds = bounds;
         }
         else { a.Bounds = bounds; a.Points = [start, end]; }

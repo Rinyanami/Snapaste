@@ -11,7 +11,7 @@ public readonly record struct DetectionCandidate(Rect Bounds, nint Handle, bool 
 public sealed class WindowDetector : IDisposable
 {
     private static readonly Lazy<AutomationWorker> Worker = new(() => new());
-    private readonly Dispatcher dispatcher = Dispatcher.CurrentDispatcher;
+    private readonly Dispatcher dispatcher;
     private readonly WindowSnapshot[] windows;
     private Query? request;
     private WindowSnapshot? resolvedWindow;
@@ -19,9 +19,13 @@ public sealed class WindowDetector : IDisposable
     private Point resolvedPixel;
     private bool disposed;
 
-    public WindowDetector() : this(Native.Desktop) { }
+    public WindowDetector() : this(Native.Desktop, null) { }
 
-    public WindowDetector(Rect screen) => windows = CaptureWindows(screen);
+    public WindowDetector(Rect screen, Dispatcher? ownerDispatcher = null)
+    {
+        dispatcher = ownerDispatcher ?? Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
+        windows = CaptureWindows(screen);
+    }
 
     // The callback is posted to the dispatcher that created this detector.
     public event Action? CandidatesChanged;
@@ -296,7 +300,7 @@ public sealed class WindowDetector : IDisposable
         T root, Point point, Rect windowBounds, Func<T, T?> firstChild, Func<T, T?> nextSibling,
         Func<T, (Rect Bounds, bool IsOffscreen)> geometry, Func<bool> stop) where T : class
     {
-        const int maximumDepth = 16, maximumNodes = 240;
+        const int maximumDepth = 24, maximumNodes = 480;
         var path = new List<Rect>();
         Rect[] best = [];
         int visited = 0;
@@ -307,6 +311,7 @@ public sealed class WindowDetector : IDisposable
         void Visit(T parent, Rect clip, int depth)
         {
             if (depth >= maximumDepth || !CanContinue()) return;
+            List<(T Node, Rect Covered, bool Narrows, double Area, double Distance)>? candidates = null;
             var child = firstChild(parent);
             while (child != null && CanContinue())
             {
@@ -319,22 +324,40 @@ public sealed class WindowDetector : IDisposable
                     if (ContainsPixel(covered, point))
                     {
                         bool narrows = covered != clip;
-                        if (narrows)
-                        {
-                            path.Add(covered);
-                            double area = covered.Width * covered.Height;
-                            if (area < bestArea || area == bestArea && path.Count > best.Length)
-                            {
-                                bestArea = area;
-                                best = path.ToArray();
-                            }
-                        }
-                        Visit(child, covered, depth + 1);
-                        if (narrows) path.RemoveAt(path.Count - 1);
+                        double area = covered.Width * covered.Height;
+                        var center = new Point(covered.X + covered.Width * 0.5, covered.Y + covered.Height * 0.5);
+                        double distance = (center - point).LengthSquared;
+                        (candidates ??= []).Add((child, covered, narrows, area, distance));
                     }
                 }
                 if (!CanContinue()) break;
                 child = nextSibling(child);
+            }
+            if (candidates == null) return;
+            if (candidates.Count > 1)
+            {
+                candidates.Sort(static (a, b) =>
+                {
+                    int narrowCmp = b.Narrows.CompareTo(a.Narrows);
+                    if (narrowCmp != 0) return narrowCmp;
+                    int areaCmp = a.Area.CompareTo(b.Area);
+                    return areaCmp != 0 ? areaCmp : a.Distance.CompareTo(b.Distance);
+                });
+            }
+            foreach (var item in candidates)
+            {
+                if (item.Narrows)
+                {
+                    path.Add(item.Covered);
+                    if (item.Area < bestArea || item.Area == bestArea && path.Count > best.Length)
+                    {
+                        bestArea = item.Area;
+                        best = path.ToArray();
+                    }
+                }
+                if (CanContinue()) Visit(item.Node, item.Covered, depth + 1);
+                if (item.Narrows) path.RemoveAt(path.Count - 1);
+                if (!CanContinue()) break;
             }
         }
 

@@ -17,12 +17,11 @@ public sealed class EditorWindow : Window
     private readonly List<(Color Color, Button Button)> colors = [];
     private readonly StackPanel colorOptions = new() { Orientation = Orientation.Horizontal };
     private readonly StackPanel sizeOptions = new() { Orientation = Orientation.Horizontal };
-    private readonly TextBlock sizeLabel = Ui.Label("线宽", 11, true);
+    private readonly TextBlock sizeLabel = Ui.Label("线宽", 11, true), sizeValue = Ui.Label("5 px", 11, true);
     private readonly Slider size = new() { Minimum = 2, Maximum = 40, Value = 5, Width = 105, VerticalAlignment = VerticalAlignment.Center };
     private readonly WrapPanel textOptions = new();
     private readonly ComboBox textFont = new() { Width = 160, IsEditable = true, MaxDropDownHeight = 220 }, textSize = new() { Width = 62, IsEditable = true };
-    private readonly CheckBox bold = new() { Content = Strings.T("Bold"), Margin = new Thickness(6) }, background = new() { Content = Strings.T("Background"), Margin = new Thickness(6) };
-    private readonly CheckBox italic = new() { Content = Strings.T("Italic"), Margin = new Thickness(6) }, underline = new() { Content = Strings.T("Underline"), Margin = new Thickness(6) };
+    private readonly CheckBox bold = new(), background = new(), italic = new(), underline = new();
     private readonly TextParagraphOptions paragraph;
     private readonly SelectionActions transforms;
     private bool updatingOptions;
@@ -38,13 +37,13 @@ public sealed class EditorWindow : Window
         var dock = new DockPanel(); contentRoot.Children.Add(dock); Content = contentRoot;
         var top = new StackPanel(); var topBorder = new Border { Child = top, BorderThickness = new Thickness(0, 0, 0, 1) }; topBorder.SetResourceReference(Border.BackgroundProperty, "PanelBrush"); topBorder.SetResourceReference(Border.BorderBrushProperty, "BorderBrush"); DockPanel.SetDock(topBorder, Dock.Top); dock.Children.Add(topBorder);
         var header = new DockPanel { Margin = new Thickness(18, 10, 18, 6), LastChildFill = false }; top.Children.Add(header);
-        var title = new StackPanel { VerticalAlignment = VerticalAlignment.Center }; title.Children.Add(Ui.Label(image.Kind == "Scroll" ? "长截图编辑" : "截图编辑", 17)); var hint = Ui.Label("标注后，复制或留作参考。", 11, true); hint.Margin = new Thickness(0, 3, 0, 0); title.Children.Add(hint); header.Children.Add(title);
+        var title = new StackPanel { VerticalAlignment = VerticalAlignment.Center }; title.Children.Add(Ui.Label(image.Kind == "Scroll" ? "长截图编辑" : "截图编辑", 17)); var hint = Ui.Label("标注后按 Enter 复制保存并退出，按 Esc 放弃并退出。", 11, true); hint.Margin = new Thickness(0, 3, 0, 0); title.Children.Add(hint); header.Children.Add(title);
         var output = new StackPanel { Orientation = Orientation.Horizontal }; DockPanel.SetDock(output, Dock.Right); header.Children.Add(output);
         output.Children.Add(Ui.Action("Ocr", Strings.T("Ocr"), ShowOcr, hint: Strings.T("OcrShortcut")));
         output.Children.Add(Ui.Action("Pin", Strings.T("Pin"), () => { if (exporting) return; PinRequested?.Invoke(Document); Completed?.Invoke(Document); Close(); }));
         output.Children.Add(Ui.Action("Save", Strings.T("Save"), Save, hint: "保存图片 · Ctrl+S"));
         output.Children.Add(Ui.Tool("Copy", "仅复制", () => Copy(false), "复制并继续编辑 · Ctrl+C"));
-        output.Children.Add(Ui.Action("Done", "复制并完成", () => Copy(true), true, "复制到剪贴板并关闭 · Enter"));
+        output.Children.Add(Ui.Action("Done", "完成保存 (Enter)", () => Copy(true), true, "复制保存并关闭 · Enter"));
         surface = new EditorSurface(Document) { CurrentTool = tool }; viewport.Content = surface; viewport.SetResourceReference(BackgroundProperty, "CanvasBrush");
         var tools = new WrapPanel { Margin = new Thickness(16, 0, 16, 0) }; top.Children.Add(tools);
         foreach (Tool t in Enum.GetValues<Tool>())
@@ -61,10 +60,16 @@ public sealed class EditorWindow : Window
             colorOptions.Children.Add(swatch.Button);
         }
         sizeLabel.Margin = new Thickness(14, 0, 6, 0); sizeLabel.VerticalAlignment = VerticalAlignment.Center; sizeOptions.Children.Add(sizeLabel);
-        size.ValueChanged += (_, _) => { if (!updatingOptions) surface.SetSize(size.Value); }; sizeOptions.Children.Add(size); options.Children.Add(sizeOptions);
+        sizeValue.Width = 34; sizeValue.Margin = new Thickness(4, 0, 0, 0); sizeValue.VerticalAlignment = VerticalAlignment.Center;
+        size.ValueChanged += (_, _) => { sizeValue.Text = $"{Math.Round(size.Value):0} px"; if (!updatingOptions) surface.SetSize(size.Value); };
+        sizeOptions.Children.Add(size); sizeOptions.Children.Add(sizeValue); options.Children.Add(sizeOptions);
         size.PreviewMouseLeftButtonDown += (_, _) => surface.BeginStyleEdit(); size.PreviewMouseLeftButtonUp += (_, _) => surface.EndStyleEdit(); size.LostMouseCapture += (_, _) => surface.EndStyleEdit();
-        textFont.ItemsSource = Fonts.SystemFontFamilies.Select(f => f.Source).Order().ToList(); textSize.ItemsSource = new[] { "12", "16", "20", "24", "32", "48", "64", "96" };
+        Ui.LoadFontsOnOpen(textFont); textSize.ItemsSource = new[] { "12", "16", "20", "24", "32", "48", "64", "96" };
         paragraph = new TextParagraphOptions(() => surface.Selection is { Kind: Tool.Text } text ? text.FontSize : surface.TextSize);
+        ConfigureStyleToggle(bold, "B", Strings.T("Bold"), FontWeights.Bold, FontStyles.Normal, false);
+        ConfigureStyleToggle(italic, "I", Strings.T("Italic"), FontWeights.Normal, FontStyles.Italic, false);
+        ConfigureStyleToggle(underline, "U", Strings.T("Underline"), FontWeights.Normal, FontStyles.Normal, true);
+        ConfigureStyleToggle(background, "底", Strings.T("Background"), FontWeights.SemiBold, FontStyles.Normal, false);
         foreach (var control in new FrameworkElement[] { textFont, textSize, bold, italic, underline, background, paragraph }) textOptions.Children.Add(control);
         Ui.ObserveText(textFont, this, () => ApplyTextStyle()); Ui.ObserveText(textSize, this, () => ApplyTextStyle(true));
         foreach (var control in new[] { textFont, textSize })
@@ -88,11 +93,34 @@ public sealed class EditorWindow : Window
         zoom.Children.Add(Ui.Tool("Minus", "缩小", () => Zoom(surface.Zoom / 1.25))); zoomLabel.VerticalAlignment = VerticalAlignment.Center; zoomLabel.Width = 48; zoomLabel.TextAlignment = TextAlignment.Center; zoom.Children.Add(zoomLabel); zoom.Children.Add(Ui.Tool("Plus", "放大", () => Zoom(surface.Zoom * 1.25))); zoom.Children.Add(Ui.Button("100%", () => Zoom(1))); zoom.Children.Add(Ui.Tool("Fit", "适合宽度", Fit));
         dock.Children.Add(viewport);
         viewport.ScrollChanged += (_, _) => RefreshViewport(); surface.Changed += Update;
+        surface.ColorPicked += hex => { status.Text = $"已复制颜色 {hex}"; status.SetResourceReference(TextBlock.ForegroundProperty, "SuccessBrush"); };
+        PreviewMouseWheel += (_, e) =>
+        {
+            if (!Keyboard.Modifiers.HasFlag(ModifierKeys.Control) || ocrPanel != null) return;
+            Zoom(surface.Zoom * (e.Delta > 0 ? 1.15 : 1 / 1.15));
+            e.Handled = true;
+        };
         PreviewKeyDown += (_, e) =>
         {
             if (ocrPanel != null) { if (e.Key == Key.Escape) { ocrPanel.Dismiss(); e.Handled = true; } return; }
-            if (e.OriginalSource is TextBox or ComboBox) return;
-            if (e.Key == Key.Enter && e.OriginalSource is ButtonBase) return;
+            if (e.OriginalSource is TextBox or ComboBox)
+            {
+                if (e.Key == Key.Escape)
+                {
+                    surface.EndStyleEdit();
+                    surface.Focus();
+                    e.Handled = true;
+                }
+                return;
+            }
+            if (e.Key == Key.Escape)
+            {
+                surface.CancelPointer();
+                surface.EndStyleEdit();
+                e.Handled = true;
+                Close();
+                return;
+            }
             if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
             {
                 if (e.Key == Key.O && Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) { ShowOcr(); e.Handled = true; }
@@ -100,6 +128,7 @@ public sealed class EditorWindow : Window
                 if (e.Key == Key.Y) { History(true); e.Handled = true; }
                 if (e.Key == Key.S) { Save(); e.Handled = true; }
                 if (e.Key == Key.C) { Copy(false); e.Handled = true; }
+                if (e.Key == Key.Enter) { Copy(true); e.Handled = true; }
             }
             else if (Keyboard.Modifiers == ModifierKeys.None)
             {
@@ -144,7 +173,27 @@ public sealed class EditorWindow : Window
     private async void Copy(bool close)
     {
         if (exporting) return; exporting = true;
-        try { await ImageExport.Copy(Document); Completed?.Invoke(Document); status.Text = "已复制到剪贴板 · 可以继续编辑"; status.SetResourceReference(TextBlock.ForegroundProperty, "SuccessBrush"); if (close) Close(); } catch (Exception e) { Ui.Error(e); }
+        try
+        {
+            await ImageExport.Copy(Document);
+            Completed?.Invoke(Document);
+            status.Text = "已复制到剪贴板 · 可以继续编辑";
+            status.SetResourceReference(TextBlock.ForegroundProperty, "SuccessBrush");
+            if (close) Close();
+        }
+        catch (InvalidOperationException) when (close)
+        {
+            try
+            {
+                if (await ImageExport.SaveDialogAsync(Document, App.Current.Settings, this))
+                {
+                    Completed?.Invoke(Document);
+                    Close();
+                }
+            }
+            catch (Exception e) { Ui.Error(e); }
+        }
+        catch (Exception e) { Ui.Error(e); }
         finally { exporting = false; }
     }
     private async void Save()
@@ -186,6 +235,16 @@ public sealed class EditorWindow : Window
             string.IsNullOrWhiteSpace(textFont.Text) ? "Microsoft YaHei UI" : textFont.Text,
             value, bold.IsChecked == true, background.IsChecked == true, italic.IsChecked == true, underline.IsChecked == true,
             paragraph.Alignment, paragraph.Indent);
+    }
+
+    internal static void ConfigureStyleToggle(CheckBox box, string symbol, string label, FontWeight weight, FontStyle style, bool underline, string? shortcut = null)
+    {
+        var text = new TextBlock { Text = symbol, FontSize = 12, FontWeight = weight, FontStyle = style, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center };
+        if (underline) text.TextDecorations = TextDecorations.Underline;
+        box.Content = text;
+        box.ToolTip = shortcut == null ? label : $"{label} · {shortcut}";
+        AutomationProperties.SetName(box, label);
+        box.SetResourceReference(FrameworkElement.StyleProperty, "CompactToggle");
     }
 
     internal static IEnumerable<(Color Color, Button Button)> CreateColorButtons(Action<Color> setColor)
@@ -291,7 +350,7 @@ internal sealed class TextDialog : Window
         const string instructions = "输入文字，按 Ctrl+Enter 应用。";
         var hint = Ui.Label(instructions, 12, true); hint.Margin = new Thickness(0, 0, 0, 14); DockPanel.SetDock(hint, Dock.Top); root.Children.Add(hint);
         var options = new WrapPanel(); DockPanel.SetDock(options, Dock.Top); root.Children.Add(options);
-        font.ItemsSource = Fonts.SystemFontFamilies.Select(f => f.Source).Order().ToList();
+        Ui.LoadFontsOnOpen(font);
         font.Text = annotation.Font;
         size.Text = annotation.FontSize.ToString(CultureInfo.InvariantCulture);
         bold.IsChecked = annotation.Bold;

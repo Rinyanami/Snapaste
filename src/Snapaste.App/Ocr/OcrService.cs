@@ -24,6 +24,18 @@ public static class OcrService
     private static readonly Lazy<nint> NativeRuntime = new(LoadNativeRuntime);
     private static RapidOcr? engine;
 
+    public static async Task WarmUpAsync(CancellationToken token = default)
+    {
+        if (engine != null) return;
+        await InferenceGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            if (engine == null) engine = await Task.Run(LoadEngine, token).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OperationCanceledException) { Log.Error("OCR warm-up", e); }
+        finally { InferenceGate.Release(); }
+    }
+
     public static async Task<OcrRecognition> RecognizeAsync(EditDocument snapshot, CancellationToken token, IProgress<OcrProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
@@ -57,7 +69,9 @@ public static class OcrService
                 string label = tileCount == 1 ? OcrMessages.Progress : OcrMessages.TileProgress(index + 1, tileCount);
                 progress?.Report(new(label + "…", index, tileCount));
 
-                using var bitmap = await RenderWorker.Run(() => RenderTile(snapshot, crop, tile, token)).ConfigureAwait(false);
+                using var bitmap = CanCopyDirect(snapshot, crop, tile)
+                    ? await Task.Run(() => CopyTileDirect(snapshot.Image.SourceBitmap!, crop, tile, token), token).ConfigureAwait(false)
+                    : await RenderWorker.Run(() => RenderTile(snapshot, crop, tile, token)).ConfigureAwait(false);
                 var report = progress == null ? null : new RecognitionProgress(progress, label, index, tileCount);
                 var result = await engine.DetectAsync(bitmap, DetectionOptions(tile), report, token).ConfigureAwait(false);
                 var neighbors = AdjacentTiles(tiles, index, row, column, columns);
@@ -147,6 +161,29 @@ public static class OcrService
         int right = (int)Math.Min(width, (long)(column + 1) * TileWidth + Overlap);
         int bottom = (int)Math.Min(height, (long)(row + 1) * TileHeight + Overlap);
         return new(x, y, right - x, bottom - y);
+    }
+
+    private static bool CanCopyDirect(EditDocument snapshot, Rect crop, Int32Rect tile)
+    {
+        if (snapshot.Annotations.Count != 0 || snapshot.Image.SourceBitmap is not { IsFrozen: true } source) return false;
+        if (source.Format != PixelFormats.Bgr32 && source.Format != PixelFormats.Bgra32 && source.Format != PixelFormats.Pbgra32) return false;
+        int srcX = (int)Math.Round(crop.X) + tile.X, srcY = (int)Math.Round(crop.Y) + tile.Y;
+        return srcX >= 0 && srcY >= 0 && srcX + tile.Width <= source.PixelWidth && srcY + tile.Height <= source.PixelHeight;
+    }
+
+    private static SKBitmap CopyTileDirect(BitmapSource source, Rect crop, Int32Rect tile, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        int srcX = (int)Math.Round(crop.X) + tile.X, srcY = (int)Math.Round(crop.Y) + tile.Y;
+        var bitmap = new SKBitmap(tile.Width, tile.Height, SKColorType.Bgra8888, SKAlphaType.Opaque);
+        try
+        {
+            nint pixels = bitmap.GetPixels();
+            if (pixels == 0) throw new OutOfMemoryException(OcrMessages.Memory);
+            source.CopyPixels(new Int32Rect(srcX, srcY, tile.Width, tile.Height), pixels, bitmap.ByteCount, bitmap.RowBytes);
+            return bitmap;
+        }
+        catch { bitmap.Dispose(); throw; }
     }
 
     private static SKBitmap RenderTile(EditDocument snapshot, Rect crop, Int32Rect tile, CancellationToken token)

@@ -13,3 +13,4 @@ app package/
 /src/Snapaste.App/Ocr/Models/*.partial
 /src/Snapaste.App/Ocr/Runtime/*.dll
 /src/Snapaste.App/Ocr/Runtime/*.partial
+/ClipDesk/

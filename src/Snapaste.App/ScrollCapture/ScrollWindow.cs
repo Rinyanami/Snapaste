@@ -1,3 +1,4 @@
+using System.Windows.Interop;
 using Snapaste.Core;
 using Snapaste.Platform;
 using Snapaste.UI;
@@ -5,31 +6,40 @@ namespace Snapaste.ScrollCapture;
 
 public sealed class ScrollWindow : Window
 {
+    private const int HotkeyEscapeId = 9201, HotkeyEnterId = 9202, WmHotkey = 0x0312;
+    private const uint ModNoRepeat = 0x4000, VkEscape = 0x1B, VkReturn = 0x0D;
     private readonly ScrollSession session;
     private readonly TextBlock stateTitle = Ui.Label("准备捕获", 18), status = Ui.Label("正在获取第一帧…", 12, true), progress = Ui.Label("", 11, true), confidence = Ui.Label("", 11), fixedHint = Ui.Label("", 11, true);
     private readonly StackPanel thumbnails = new();
     private readonly ScrollViewer preview;
     private readonly List<ImageSegment> rendered = [];
-    private readonly Button pause, automatic, undo, finish;
+    private readonly Button pause, automatic, undo, editButton, finish;
     private readonly Border recovery;
     private CancellationTokenSource? previewWork;
     private string? lastPreviewPath;
     private int lastPreviewBottom;
-    private bool closed, aligning;
+    private bool closed, aligning, keysRegistered;
+    private ScrollRegionIndicator? regionIndicator;
+    public bool EditRequested { get; private set; }
     public ScrollWindow(ScrollSession session)
     {
-        this.session = session; Title = "Snapaste · 滚动截图"; Width = 326; Height = 680; MinWidth = 310; MinHeight = 560; Topmost = true; ShowActivated = false; Ui.Setup(this);
+        this.session = session; Title = "Snapaste · 滚动截图"; Width = 336; Height = 680; MinWidth = 316; MinHeight = 560; Topmost = true; ShowActivated = false; Ui.Setup(this);
         var root = new DockPanel { Margin = new Thickness(16, 18, 16, 14) }; Content = root;
-        var footer = new Grid { Margin = new Thickness(0, 12, 0, 0) }; footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); footer.ColumnDefinitions.Add(new ColumnDefinition()); DockPanel.SetDock(footer, Dock.Bottom); root.Children.Add(footer);
-        var cancel = Ui.Button("取消", Close); cancel.SetResourceReference(StyleProperty, "QuietButton"); footer.Children.Add(cancel);
-        finish = Ui.Action("Done", "完成并编辑", () => { if (session.Frames.Count == 0) return; session.Complete(); Close(); }, true); finish.IsEnabled = false; Grid.SetColumn(finish, 1); footer.Children.Add(finish);
+        var footer = new Grid { Margin = new Thickness(0, 12, 0, 0) };
+        footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        footer.ColumnDefinitions.Add(new ColumnDefinition());
+        DockPanel.SetDock(footer, Dock.Bottom); root.Children.Add(footer);
+        var cancel = Ui.Button("取消 (Esc)", CancelAndClose); cancel.ToolTip = "退出并放弃本次长截图 · Esc"; cancel.SetResourceReference(StyleProperty, "QuietButton"); footer.Children.Add(cancel);
+        editButton = Ui.Button("编辑", () => FinishCapture(openEditor: true)); editButton.ToolTip = "完成拼接并进入编辑页面"; editButton.IsEnabled = false; Grid.SetColumn(editButton, 1); footer.Children.Add(editButton);
+        finish = Ui.Action("Done", "完成保存 (Enter)", () => FinishCapture(openEditor: false), true, "直接完成并保存截图 · Enter"); finish.IsEnabled = false; Grid.SetColumn(finish, 2); footer.Children.Add(finish);
         var head = new StackPanel(); DockPanel.SetDock(head, Dock.Top); root.Children.Add(head);
-        var eyebrow = Ui.Label("滚动长截图", 11, true); eyebrow.Margin = new Thickness(0, 0, 0, 8); head.Children.Add(eyebrow); stateTitle.FontWeight = FontWeights.SemiBold; head.Children.Add(stateTitle);
+        var eyebrow = Ui.Label("滚动长截图 · Enter 保存退出 · Esc 取消", 11, true); eyebrow.Margin = new Thickness(0, 0, 0, 8); head.Children.Add(eyebrow); stateTitle.FontWeight = FontWeights.SemiBold; head.Children.Add(stateTitle);
         status.Margin = new Thickness(0, 8, 0, 12); status.MinHeight = 38; head.Children.Add(status);
         var buttons = new Grid(); buttons.ColumnDefinitions.Add(new ColumnDefinition()); buttons.ColumnDefinitions.Add(new ColumnDefinition()); head.Children.Add(buttons);
         pause = Ui.Action("Pause", "暂停", () => { if (session.State == ScrollState.Paused) session.Resume(); else session.Pause(); }); pause.IsEnabled = false; buttons.Children.Add(pause);
         automatic = Ui.Action("Auto", "自动滚动", () => session.SetAutomatic(!session.Automatic)); automatic.IsEnabled = false; Grid.SetColumn(automatic, 1); buttons.Children.Add(automatic);
-        var recoverContent = new StackPanel(); var explanation = Ui.Label("当前帧尚未加入。可以手动对齐、忽略，或完成已拼接的内容。", 11, true); explanation.Margin = new Thickness(0, 0, 0, 10); recoverContent.Children.Add(explanation);
+        var recoverContent = new StackPanel(); var explanation = Ui.Label("当前帧尚未加入。可以手动对齐、忽略，或按 Enter 完成已拼接的内容。", 11, true); explanation.Margin = new Thickness(0, 0, 0, 10); recoverContent.Children.Add(explanation);
         var recoverActions = new WrapPanel(); recoverContent.Children.Add(recoverActions); recoverActions.Children.Add(Ui.Action("Correction", "手动对齐", Correct, true)); recoverActions.Children.Add(Ui.Action("Ignore", "忽略此帧", session.Ignore));
         recovery = Ui.Card(recoverContent, 12); recovery.Margin = new Thickness(0, 10, 0, 6); recovery.Visibility = Visibility.Collapsed; head.Children.Add(recovery);
         var facts = new DockPanel { Margin = new Thickness(0, 10, 0, 2), LastChildFill = false }; progress.VerticalAlignment = VerticalAlignment.Center; facts.Children.Add(progress); undo = Ui.Tool("Undo", "撤销上一段", session.Undo, "撤销后将页面滚回对应位置，再继续"); undo.IsEnabled = false; DockPanel.SetDock(undo, Dock.Right); facts.Children.Add(undo); head.Children.Add(facts);
@@ -39,6 +49,8 @@ public sealed class ScrollWindow : Window
         void FixedInput(string label, int column, Action<int> set)
         {
             var group = new StackPanel { Margin = new Thickness(column == 0 ? 0 : 8, 0, 0, 0) }; Grid.SetColumn(group, column); overrides.Children.Add(group); group.Children.Add(Ui.Label(label, 11, true)); var input = new TextBox { Text = "-1", Margin = new Thickness(0, 5, 0, 0) }; group.Children.Add(input); System.Windows.Automation.AutomationProperties.SetName(input, label);
+            input.GotKeyboardFocus += (_, _) => UnregisterCaptureKeys();
+            input.LostKeyboardFocus += (_, _) => RegisterCaptureKeys();
             input.TextChanged += (_, _) => { if (int.TryParse(input.Text, out int v) && v >= -1 && v <= (int)session.Region.Height / 3) { set(v); input.ToolTip = "-1 自动 · 0 无固定栏"; input.SetResourceReference(Control.BorderBrushProperty, "BorderBrush"); } else { input.ToolTip = $"请输入 -1 至 {(int)session.Region.Height / 3} 的整数"; input.SetResourceReference(Control.BorderBrushProperty, "WarningBrush"); } };
         }
         FixedInput("固定顶部 / px", 0, v => session.TopOverride = v); FixedInput("固定底部 / px", 1, v => session.BottomOverride = v); advanced.Children.Add(fixedHint);
@@ -50,12 +62,32 @@ public sealed class ScrollWindow : Window
         SourceInitialized += (_, _) =>
         {
             session.ControlHandle = Native.Handle(this);
+            if (PresentationSource.FromVisual(this) is HwndSource source) source.AddHook(WndProc);
+            RegisterCaptureKeys();
             PositionPanel();
             UpdateCaptureExclusion();
+            try
+            {
+                regionIndicator = new ScrollRegionIndicator(session.Region);
+                regionIndicator.Show();
+            }
+            catch (Exception e) { Log.Error("Scroll region indicator", e); }
         };
         LocationChanged += (_, _) => UpdateCaptureExclusion();
         SizeChanged += (_, _) => UpdateCaptureExclusion();
-        PreviewKeyDown += (_, e) => { if (e.Key == Key.Escape) { e.Handled = true; Close(); } };
+        PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Escape)
+            {
+                e.Handled = true;
+                CancelAndClose();
+            }
+            else if (e.Key == Key.Enter && Keyboard.Modifiers == ModifierKeys.None && e.OriginalSource is not TextBox)
+            {
+                e.Handled = true;
+                FinishCapture(openEditor: false);
+            }
+        };
         Loaded += async (_, _) =>
         {
             UpdateCaptureExclusion();
@@ -64,10 +96,63 @@ public sealed class ScrollWindow : Window
         Closed += (_, _) =>
         {
             closed = true;
+            UnregisterCaptureKeys();
+            try { regionIndicator?.Close(); } catch { }
+            regionIndicator = null;
             previewWork?.Cancel();
             session.Updated -= OnUpdated;
             session.Dispose();
         };
+    }
+
+    private void CancelAndClose()
+    {
+        if (closed) return;
+        session.Cancel();
+        Close();
+    }
+
+    private void FinishCapture(bool openEditor)
+    {
+        if (closed || session.Frames.Count == 0 || session.State is ScrollState.Completed or ScrollState.Cancelled) return;
+        EditRequested = openEditor;
+        session.Complete();
+        Close();
+    }
+
+    private void RegisterCaptureKeys()
+    {
+        if (closed || aligning || keysRegistered || session.ControlHandle == 0) return;
+        Native.RegisterHotKey(session.ControlHandle, HotkeyEscapeId, ModNoRepeat, VkEscape);
+        Native.RegisterHotKey(session.ControlHandle, HotkeyEnterId, ModNoRepeat, VkReturn);
+        keysRegistered = true;
+    }
+
+    private void UnregisterCaptureKeys()
+    {
+        if (!keysRegistered || session.ControlHandle == 0) return;
+        Native.UnregisterHotKey(session.ControlHandle, HotkeyEscapeId);
+        Native.UnregisterHotKey(session.ControlHandle, HotkeyEnterId);
+        keysRegistered = false;
+    }
+
+    private nint WndProc(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
+    {
+        if (msg == WmHotkey && !closed && !aligning)
+        {
+            int id = (int)wParam;
+            if (id == HotkeyEscapeId)
+            {
+                handled = true;
+                CancelAndClose();
+            }
+            else if (id == HotkeyEnterId)
+            {
+                handled = true;
+                if (session.Frames.Count > 0) FinishCapture(openEditor: false);
+            }
+        }
+        return 0;
     }
 
     private void PositionPanel()
@@ -138,8 +223,10 @@ public sealed class ScrollWindow : Window
         automatic.ToolTip = session.CanAutomate ? (session.Automatic ? "切换手动" : "自动滚动") : "无法识别目标窗口，请手动滚动。";
         recovery.Visibility = pending ? Visibility.Visible : Visibility.Collapsed;
         undo.IsEnabled = session.Frames.Count > 1 && !busy && session.State is not ScrollState.Completed and not ScrollState.Cancelled;
-        SetButtonLabel(finish, pending ? "完成已拼接内容" : "完成并编辑");
-        finish.IsEnabled = session.Frames.Count > 0 && session.State is not ScrollState.Completed and not ScrollState.Cancelled;
+        bool canFinish = session.Frames.Count > 0 && session.State is not ScrollState.Completed and not ScrollState.Cancelled;
+        SetButtonLabel(finish, pending ? "完成已拼接内容" : "完成保存 (Enter)");
+        finish.IsEnabled = canFinish;
+        editButton.IsEnabled = canFinish;
         fixedHint.Text = $"当前识别：顶部 {session.FixedTop}px · 底部 {session.FixedBottom}px";
         if (session.Frames.Count == 0) return;
         var last = session.Frames[^1];
@@ -232,6 +319,7 @@ public sealed class ScrollWindow : Window
         var body = new Int32Rect(0, top, pending.PixelWidth, pending.PixelHeight - top - bottom);
         int suggestion = session.LastMatch?.Offset ?? maximum / 2;
         aligning = true;
+        UnregisterCaptureKeys();
         try
         {
             var (a, b) = await Task.Run(() => (ImageDocument.Detach(new CroppedBitmap(previous.Bitmap, body)), ImageDocument.Detach(new CroppedBitmap(pending, body))));
@@ -245,9 +333,44 @@ public sealed class ScrollWindow : Window
             if (dialog.ShowDialog() == true) session.Manual(dialog.Offset);
         }
         catch (Exception e) { if (!closed && session.Pending == pending) Ui.Error(e, this); }
-        finally { aligning = false; }
+        finally { aligning = false; RegisterCaptureKeys(); }
     }
 }
+
+internal sealed class ScrollRegionIndicator : Window
+{
+    public ScrollRegionIndicator(Rect region)
+    {
+        Title = "Snapaste · 滚动区域";
+        WindowStyle = WindowStyle.None;
+        ResizeMode = ResizeMode.NoResize;
+        AllowsTransparency = true;
+        Background = Brushes.Transparent;
+        ShowInTaskbar = false;
+        ShowActivated = false;
+        Topmost = true;
+        Focusable = false;
+        IsHitTestVisible = false;
+        var rect = new System.Windows.Shapes.Rectangle
+        {
+            Stroke = Ui.Accent,
+            StrokeThickness = 2,
+            StrokeDashArray = new DoubleCollection { 4, 3 },
+            RadiusX = 3,
+            RadiusY = 3,
+            IsHitTestVisible = false
+        };
+        Content = rect;
+        var outer = new Rect(region.X - 4, region.Y - 4, region.Width + 8, region.Height + 8);
+        SourceInitialized += (_, _) =>
+        {
+            Native.MakeClickThroughToolWindow(this);
+            if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041)) Native.ExcludeFromCapture(this);
+            Native.PlacePhysical(this, outer);
+        };
+    }
+}
+
 internal sealed class AlignmentWindow : Window
 {
     private readonly Slider slider;

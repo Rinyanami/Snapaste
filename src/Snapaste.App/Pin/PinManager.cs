@@ -30,6 +30,10 @@ public sealed class PinManager
     private readonly DispatcherTimer saveTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
     private bool exiting;
     private bool loaded;
+    private bool restoring, hideRestored;
+    private readonly HashSet<PinState> pendingRestore = [];
+    private readonly object writeGate = new();
+    private readonly List<Task> pendingWrites = [];
     private static string Manifest => Path.Combine(Paths.Pins, "pins.json");
 
     public PinManager()
@@ -52,12 +56,13 @@ public sealed class PinManager
         var position = origin ?? Native.Cursor;
         var state = new PinState { X = position.X, Y = position.Y, Opacity = settings.PinOpacity, Scale = settings.PinScale, Topmost = settings.PinTopmost };
         state.ImagePath = Path.Combine(Paths.Pins, state.Id + ".png");
-        ImageDocument.SaveBitmap(bitmap, state.ImagePath);
         PinWindow? pin = null;
         try
         {
             pin = Open(state, bitmap, true);
-            Save();
+            QueueSaveBitmap(bitmap, state.ImagePath);
+            saveTimer.Stop();
+            saveTimer.Start();
         }
         catch
         {
@@ -67,9 +72,31 @@ public sealed class PinManager
         }
     }
 
-    private PinWindow Open(PinState state, BitmapSource bitmap, bool fit = false)
+    private void QueueSaveBitmap(BitmapSource bitmap, string path)
     {
-        var pin = new PinWindow(state, bitmap, fit);
+        Task? task = null;
+        lock (writeGate)
+        {
+            task = Task.Run(() => ImageDocument.SaveBitmap(bitmap, path));
+            pendingWrites.Add(task);
+        }
+        _ = task.ContinueWith(t =>
+        {
+            lock (writeGate) pendingWrites.Remove(t);
+            if (t.IsFaulted && t.Exception != null) Log.Error("Pin bitmap save", t.Exception.GetBaseException());
+        }, TaskScheduler.Default);
+    }
+
+    private void FlushPendingWrites()
+    {
+        Task[] tasks;
+        lock (writeGate) tasks = pendingWrites.ToArray();
+        if (tasks.Length > 0) Task.WaitAll(tasks);
+    }
+
+    private PinWindow Open(PinState state, BitmapSource bitmap, bool fit = false, bool show = true)
+    {
+        var pin = new PinWindow(state, bitmap, fit) { ShowActivated = fit };
         pin.Changed += () => { saveTimer.Stop(); saveTimer.Start(); };
         pin.EditRequested += () =>
         {
@@ -91,7 +118,7 @@ public sealed class PinManager
             saveTimer.Stop();
             saveTimer.Start();
         };
-        try { pin.Show(); }
+        try { if (show) pin.Show(); }
         catch { pin.Close(); throw; }
         pins.Add(pin);
         return pin;
@@ -121,25 +148,73 @@ public sealed class PinManager
         loaded = true;
     }
 
-    public void Restore()
+    public void Restore() => RestoreCore(false, null).GetAwaiter().GetResult();
+
+    public Task RestoreAsync(Func<Task> waitForCapture)
+        => RestoreCore(true, waitForCapture);
+
+    private async Task RestoreCore(bool background, Func<Task>? waitForCapture)
     {
+        if (restoring || exiting) return;
         try { LoadState(); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log.Error("Pin manifest", e); return; }
-        foreach (var state in inactive.ToArray())
+        restoring = true;
+        var states = inactive.ToArray();
+        pendingRestore.UnionWith(states);
+        using var throttle = new SemaphoreSlim(Math.Clamp(Environment.ProcessorCount, 2, 4));
+        try
         {
-            try
+            Task<(BitmapSource? Image, Exception? Error)>[]? decodeTasks = null;
+            if (background && states.Length > 1)
             {
-                if (!File.Exists(state.ImagePath)) continue;
-                Open(state, ImageDocument.ReadBitmap(state.ImagePath, maxPixels: MaxImagePixels));
-                inactive.Remove(state);
+                decodeTasks = states.Select(state => Task.Run(async () =>
+                {
+                    await throttle.WaitAsync().ConfigureAwait(false);
+                    try
+                    {
+                        if (exiting || !pendingRestore.Contains(state)) return ((BitmapSource?)null, (Exception?)null);
+                        return (ImageDocument.ReadBitmap(state.ImagePath, maxPixels: MaxImagePixels), null);
+                    }
+                    catch (Exception e) when (e is not OutOfMemoryException) { return (null, e); }
+                    finally { throttle.Release(); }
+                })).ToArray();
             }
-            catch (Exception e) when (e is not OutOfMemoryException) { Log.Error("Pin restore", e); }
+
+            for (int i = 0; i < states.Length; i++)
+            {
+                var state = states[i];
+                if (exiting || !pendingRestore.Contains(state)) break;
+                try
+                {
+                    BitmapSource image;
+                    if (decodeTasks != null)
+                    {
+                        var (decoded, error) = await decodeTasks[i];
+                        if (error != null) throw error;
+                        if (decoded == null) continue;
+                        image = decoded;
+                    }
+                    else
+                    {
+                        BitmapSource Read() => ImageDocument.ReadBitmap(state.ImagePath, maxPixels: MaxImagePixels);
+                        image = background ? await Task.Run(Read) : Read();
+                    }
+                    if (waitForCapture != null) await waitForCapture();
+                    if (exiting || !pendingRestore.Contains(state)) break;
+                    Open(state, image, show: !hideRestored);
+                    inactive.Remove(state);
+                }
+                catch (Exception e) when (e is not OutOfMemoryException) { Log.Error("Pin restore", e); }
+                finally { pendingRestore.Remove(state); }
+            }
         }
+        finally { pendingRestore.Clear(); restoring = false; }
     }
 
     public void Save()
     {
         if (!loaded) return;
+        FlushPendingWrites();
         AtomicFile.Write(Manifest, JsonSerializer.Serialize(pins.Select(pin => pin.State).Concat(inactive), Settings.Json));
         foreach (var path in retired.ToArray())
             if (DeleteCache(path)) retired.Remove(path);
@@ -151,11 +226,23 @@ public sealed class PinManager
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log.Error("Pin cache cleanup", e); return false; }
     }
 
-    public void ShowAll() { foreach (var p in pins) p.Show(); }
-    public void HideAll() { foreach (var p in pins) p.Hide(); }
+    public void ShowAll() { hideRestored = false; foreach (var p in pins) p.Show(); }
+    public void HideAll() { hideRestored = true; foreach (var p in pins) p.Hide(); }
     public void EnsureReachable() { foreach (var p in pins) p.KeepReachable(); }
-    public void Recover() { foreach (var p in pins) { p.ClickThrough = false; p.Show(); p.KeepReachable(); } }
-    public void CloseAll() { foreach (var p in pins.ToArray()) p.Close(); }
+    public void Recover() { hideRestored = false; foreach (var p in pins) { p.ClickThrough = false; p.Show(); p.KeepReachable(); } }
+    public void CloseAll()
+    {
+        foreach (var p in pins.ToArray()) p.Close();
+        if (pendingRestore.Count == 0) return;
+        foreach (var state in pendingRestore)
+        {
+            inactive.Remove(state);
+            retired.Add(state.ImagePath);
+        }
+        pendingRestore.Clear();
+        saveTimer.Stop();
+        saveTimer.Start();
+    }
 
     public void Exit()
     {
@@ -169,9 +256,18 @@ public sealed class PinManager
 
 public sealed class PinWindow : Window
 {
+    private static readonly Brush IdleBorderBrush = CreateFrozenBrush(Color.FromArgb(100, 136, 136, 136));
+    private static readonly Brush HudFillBrush = CreateFrozenBrush(Color.FromArgb(208, 25, 23, 32));
+    private static readonly Brush HudStrokeBrush = CreateFrozenBrush(Color.FromArgb(90, 255, 255, 255));
+    private static SolidColorBrush CreateFrozenBrush(Color color) { var b = new SolidColorBrush(color); b.Freeze(); return b; }
+
     public PinState State { get; }
     public BitmapSource Bitmap { get; private set; }
     private readonly Image image = new() { Stretch = Stretch.Fill };
+    private readonly Border frameBorder = new() { BorderThickness = new Thickness(1), BorderBrush = IdleBorderBrush, IsHitTestVisible = false };
+    private readonly TextBlock hudText = new() { Foreground = Brushes.White, FontSize = 11, FontWeight = FontWeights.SemiBold };
+    private readonly Border hudBadge;
+    private readonly DispatcherTimer hudTimer = new() { Interval = TimeSpan.FromMilliseconds(900) };
     private bool through;
     private bool positioned;
     private bool repositioning;
@@ -186,6 +282,7 @@ public sealed class PinWindow : Window
             if (through == value) return;
             Native.ClickThrough(this, value);
             through = value;
+            ShowHud(value ? "鼠标穿透" : "已恢复交互");
         }
     }
 
@@ -201,7 +298,29 @@ public sealed class PinWindow : Window
         ShowInTaskbar = false;
         Topmost = state.Topmost;
         Opacity = state.Opacity = double.IsFinite(state.Opacity) ? Math.Clamp(state.Opacity, .15, 1) : 1;
-        Content = image;
+        hudBadge = new Border
+        {
+            Background = HudFillBrush,
+            BorderBrush = HudStrokeBrush,
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(5),
+            Padding = new Thickness(7, 3, 7, 3),
+            Margin = new Thickness(6),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Top,
+            Visibility = Visibility.Collapsed,
+            IsHitTestVisible = false,
+            Child = hudText
+        };
+        hudTimer.Tick += (_, _) => { hudTimer.Stop(); hudBadge.Visibility = Visibility.Collapsed; };
+        var container = new Grid();
+        container.Children.Add(image);
+        container.Children.Add(frameBorder);
+        container.Children.Add(hudBadge);
+        Content = container;
+        Activated += (_, _) => frameBorder.BorderBrush = Application.Current?.TryFindResource("AccentBrush") as Brush ?? IdleBorderBrush;
+        Deactivated += (_, _) => frameBorder.BorderBrush = IdleBorderBrush;
+        Closed += (_, _) => hudTimer.Stop();
         if (!ValidCoordinate(state.X) || !ValidCoordinate(state.Y))
         {
             var position = Native.Cursor;
@@ -280,9 +399,10 @@ public sealed class PinWindow : Window
             UpdateImage();
             Reposition();
             KeepReachable(true);
+            ShowHud($"{State.Scale * 100:0}%");
             Changed?.Invoke();
         });
-        Item(Strings.T("AlwaysTop"), () => { State.Topmost = Topmost = !Topmost; Changed?.Invoke(); });
+        Item(Strings.T("AlwaysTop"), () => { State.Topmost = Topmost = !Topmost; ShowHud(Topmost ? "已置顶" : "取消置顶"); Changed?.Invoke(); });
         Item("透明度 +10%", () => AdjustOpacity(.1));
         Item("透明度 −10%", () => AdjustOpacity(-.1));
         var passThrough = Item(Strings.T("ClickThrough"), () => ClickThrough = !ClickThrough);
@@ -335,6 +455,7 @@ public sealed class PinWindow : Window
             State.X = anchor.X - (anchor.X - previous.X) * size.Width / previous.Width;
             State.Y = anchor.Y - (anchor.Y - previous.Y) * size.Height / previous.Height;
             Reposition();
+            ShowHud($"{State.Scale * 100:0}%");
             Changed?.Invoke();
         }
         e.Handled = true;
@@ -343,7 +464,16 @@ public sealed class PinWindow : Window
     private void AdjustOpacity(double delta)
     {
         State.Opacity = Opacity = Math.Clamp(Opacity + delta, .15, 1);
+        ShowHud($"透明度 {State.Opacity * 100:0}%");
         Changed?.Invoke();
+    }
+
+    private void ShowHud(string text)
+    {
+        hudText.Text = text;
+        hudBadge.Visibility = Visibility.Visible;
+        hudTimer.Stop();
+        hudTimer.Start();
     }
 
     public void Replace(BitmapSource source)
@@ -376,6 +506,7 @@ public sealed class PinWindow : Window
         UpdateImage();
         Reposition();
         KeepReachable();
+        ShowHud($"{State.Rotation}°");
         Changed?.Invoke();
     }
 

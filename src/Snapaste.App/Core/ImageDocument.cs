@@ -12,6 +12,7 @@ public sealed class ImageDocument
     public int Height { get; }
     public string Kind { get; }
     public Rect Bounds => new(0, 0, Width, Height);
+    internal BitmapSource? SourceBitmap => original;
 
     public ImageDocument(BitmapSource source, string kind = "Capture")
     {

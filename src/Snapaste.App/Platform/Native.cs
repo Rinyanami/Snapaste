@@ -22,6 +22,7 @@ public static class Native
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc proc, nint p);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(nint h, int attribute, out RECT rect, int size);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(nint h, int attribute, out int value, int size);
+    [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(nint h, int attribute, ref int value, int size);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool RegisterHotKey(nint h, int id, uint mods, uint key);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(nint h, int id);
     [DllImport("user32.dll", SetLastError = true)] public static extern nint GetWindowLongPtr(nint h, int index);
@@ -65,4 +66,19 @@ public static class Native
     public static Point PixelToDip(Point pixel, double dpi) => new(pixel.X * 96 / dpi, pixel.Y * 96 / dpi);
     public static void PlacePhysical(Window window, Rect pixels)
         => SetWindowPos(Handle(window), 0, (int)pixels.X, (int)pixels.Y, (int)pixels.Width, (int)pixels.Height, 0x14);
+    public static void ApplyDarkTitleBar(Window window, bool dark)
+    {
+        var handle = Handle(window);
+        if (handle == 0) return;
+        int enabled = dark ? 1 : 0;
+        if (DwmSetWindowAttribute(handle, 20, ref enabled, sizeof(int)) != 0)
+            DwmSetWindowAttribute(handle, 19, ref enabled, sizeof(int));
+    }
+    public static void MakeClickThroughToolWindow(Window w)
+    {
+        var handle = Handle(w);
+        if (handle == 0) return;
+        var style = GetWindowLongPtr(handle, -20).ToInt64();
+        SetWindowLongPtr(handle, -20, (nint)(style | 0x20L | 0x80000L | 0x80L | 0x08000000L));
+    }
 }

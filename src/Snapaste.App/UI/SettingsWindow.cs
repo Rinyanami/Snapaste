@@ -115,24 +115,33 @@ public sealed class SettingsWindow : Window
         Choice(g1, "主题", "选择应用窗口的配色", ["Light", "Dark", "System"], ["浅色", "深色", "跟随系统"], draft.Theme, v => draft.Theme = v);
         Check(g1, "开机启动", "登录 Windows 后在任务栏右下角显示图标", draft.StartWithWindows, v => draft.StartWithWindows = v);
         var g2 = Group(general, "图片保存");
-        saveDirectory = Text(g2, "默认保存文件夹", "保存时仍可选择其他位置", draft.SaveDirectory, v => draft.SaveDirectory = v, 220);
+        saveDirectory = new TextBox { Text = draft.SaveDirectory, Width = 200, VerticalAlignment = VerticalAlignment.Center };
+        saveDirectory.TextChanged += (_, _) => Changed();
+        apply.Add((saveDirectory, () => draft.SaveDirectory = saveDirectory.Text.Trim()));
         var browse = Ui.Action("Folder", "选择文件夹", () =>
         {
             var dialog = new Microsoft.Win32.OpenFolderDialog { Title = "选择默认保存文件夹", InitialDirectory = Directory.Exists(saveDirectory.Text) ? saveDirectory.Text : "" };
             if (dialog.ShowDialog(this) == true) saveDirectory.Text = dialog.FolderName;
         });
-        browse.HorizontalAlignment = HorizontalAlignment.Right;
-        g2.Children.Add(browse);
+        browse.Margin = new Thickness(8, 0, 0, 0);
+        var folderRow = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        folderRow.Children.Add(saveDirectory);
+        folderRow.Children.Add(browse);
+        Row(g2, "默认保存文件夹", "保存时仍可选择其他位置", folderRow);
         var local = Group(general, "只在本机"); local.Children.Add(Ui.Label("无需账号，离线也能完整使用。图片和历史不会上传。", 12, true));
         var path = Ui.Label("本地数据：" + Paths.Data, 11, true); path.Margin = new Thickness(0, 12, 0, 0); local.Children.Add(path);
         var hotkeys = Page("Hotkeys");
-        Notice(hotkeys, "在输入框中填写按键名称，例如 F1、Ctrl+F1 或 Ctrl+Alt+F3。保存时会检查快捷键是否可用。");
+        Notice(hotkeys, "点击输入框后可直接按下组合键录制（如 F1、Ctrl+Shift+A），也可手动输入。保存时会检查快捷键是否可用。");
         hotkeyStatus.SetResourceReference(TextBlock.ForegroundProperty, "WarningBrush");
         hotkeyStatus.Margin = new Thickness(3, 2, 0, 10);
         hotkeys.Children.Add(hotkeyStatus);
         var keys = Group(hotkeys, "全局快捷键");
         (string, TextBox) Shortcut(string label, string hint, string value, Action<string> set)
-            => (label, Text(keys, label, hint, value, set));
+        {
+            var editor = Text(keys, label, hint, value, set);
+            AttachHotkeyRecorder(editor);
+            return (label, editor);
+        }
         hotkeyFields =
         [
             Shortcut("普通截图", "获取屏幕画面并选择区域", draft.CaptureKey, v => draft.CaptureKey = v),
@@ -164,9 +173,9 @@ public sealed class SettingsWindow : Window
         Choice(flow, "默认模式", "手动模式由你滚动页面，无需逐帧点击", ["Manual", "Auto"], ["手动滚动", "自动滚动"], draft.AutoScrollDefault ? "Auto" : "Manual", v => draft.AutoScrollDefault = v == "Auto");
         Check(flow, "实时长图预览", "每次拼接后显示新增内容", draft.ScrollPreview, v => draft.ScrollPreview = v);
         var timing = Group(scroll, "节奏与可靠性");
-        Number(timing, "画面稳定等待", "毫秒 · 动画和图片加载较多时可增大", draft.StableMilliseconds, 200, 5000, v => draft.StableMilliseconds = (int)v, true);
+        Number(timing, "画面稳定等待", "毫秒 · 动画和图片加载较多时可增大", draft.StableMilliseconds, 100, 5000, v => draft.StableMilliseconds = (int)v, true);
         Number(timing, "匹配最低得分", "0.5–0.98 · 越高越谨慎", draft.MatchSensitivity, .5, .98, v => draft.MatchSensitivity = v);
-        Number(timing, "自动滚动间隔", "毫秒 · 为页面加载留下时间", draft.AutoScrollDelay, 500, 10000, v => draft.AutoScrollDelay = (int)v, true);
+        Number(timing, "自动滚动间隔", "毫秒 · 为页面加载留下时间", draft.AutoScrollDelay, 200, 10000, v => draft.AutoScrollDelay = (int)v, true);
         Number(timing, "最大捕获帧数", "达到上限后暂停，由你决定完成", draft.MaxScrollFrames, 2, 1000, v => draft.MaxScrollFrames = (int)v, true);
         Notice(scroll, "无法可靠匹配时会暂停。你可以手动对齐、忽略此帧或完成已有内容。");
         var history = Page("History", "历史设置");
@@ -245,6 +254,40 @@ public sealed class SettingsWindow : Window
     private TextBox Text(Panel p, string title, string hint, string value, Action<string> set, double width = 168)
     {
         var t = new TextBox { Text = value, Width = width }; Row(p, title, hint, t); t.TextChanged += (_, _) => Changed(); apply.Add((t, () => set(t.Text.Trim()))); return t;
+    }
+    private static void AttachHotkeyRecorder(TextBox editor)
+    {
+        editor.PreviewKeyDown += (_, e) =>
+        {
+            var key = e.Key == Key.System ? e.SystemKey : e.Key;
+            if (key is Key.Tab or Key.Escape or Key.LeftCtrl or Key.RightCtrl or Key.LeftAlt or Key.RightAlt or Key.LeftShift or Key.RightShift or Key.LWin or Key.RWin)
+                return;
+            if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.S) return;
+            if (Keyboard.Modifiers == ModifierKeys.None && key is Key.Back or Key.Delete)
+            {
+                editor.Text = "";
+                e.Handled = true;
+                return;
+            }
+            bool isFunctionOrSpecial = key is (>= Key.F1 and <= Key.F24) or Key.PrintScreen or Key.Pause or Key.Insert;
+            if (Keyboard.Modifiers == ModifierKeys.None && !isFunctionOrSpecial) return;
+            var parts = new List<string>(4);
+            var mods = Keyboard.Modifiers;
+            if (mods.HasFlag(ModifierKeys.Control)) parts.Add("Ctrl");
+            if (mods.HasFlag(ModifierKeys.Alt)) parts.Add("Alt");
+            if (mods.HasFlag(ModifierKeys.Shift)) parts.Add("Shift");
+            if (mods.HasFlag(ModifierKeys.Windows)) parts.Add("Win");
+            parts.Add(new KeyConverter().ConvertToInvariantString(key) ?? key.ToString());
+            var candidate = string.Join("+", parts);
+            try
+            {
+                _ = Hotkeys.Parse(candidate);
+                editor.Text = candidate;
+                editor.CaretIndex = candidate.Length;
+                e.Handled = true;
+            }
+            catch (HotkeyRegistrationException) { }
+        };
     }
     private void Number(Panel p, string title, string hint, double value, double min, double max, Action<double> set, bool integer = false)
         => Text(p, title, hint, value.ToString(System.Globalization.CultureInfo.InvariantCulture), v => { if (!double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var n) || !double.IsFinite(n) || n < min || n > max) throw new ArgumentException($"{title} 必须在 {min}–{max} 范围内。"); if (integer && n != Math.Truncate(n)) throw new ArgumentException($"{title} 请输入整数。"); set(n); });

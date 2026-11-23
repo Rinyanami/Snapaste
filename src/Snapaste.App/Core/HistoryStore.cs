@@ -172,6 +172,16 @@ public sealed class HistoryStore
         }
     }
 
+    public void Delete(string id)
+    {
+        if (!Guid.TryParseExact(id, "N", out _)) return;
+        lock (Gate)
+        {
+            var directory = Path.Combine(Paths.History, id);
+            if (Directory.Exists(directory)) Retire(directory);
+        }
+    }
+
     private static void Retire(string directory)
     {
         if (OpenImages.TryGetValue(directory, out var reference) && reference.TryGetTarget(out _))
